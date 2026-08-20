@@ -8,6 +8,7 @@
   "license": "MIT",
   "scripts": {
     "dev": "electron-vite dev",
+    "postinstall": "install-electron",
     "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
     "test": "vitest run",
     "build": "npm run typecheck && npm run test && electron-vite build",
