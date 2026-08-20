@@ -1,0 +1,50 @@
+name: Import initial repository
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/bootstrap-import.yml
+
+permissions:
+  contents: write
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Replace bootstrap branch with a clean source commit
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/personal-tool-source"
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          archive = Path("personal-tool-source.zip")
+          destination = Path(os.environ["RUNNER_TEMP"]) / "personal-tool-source"
+          root = destination.resolve()
+
+          with ZipFile(archive) as source:
+              for item in source.infolist():
+                  target = (root / item.filename).resolve()
+                  if target != root and root not in target.parents:
+                      raise RuntimeError(f"Unsafe archive path: {item.filename}")
+              source.extractall(root)
+          PY
+
+          rm -f "$RUNNER_TEMP/personal-tool-source/.github/workflows/windows.yml"
+          cp .github/workflows/bootstrap-import.yml "$RUNNER_TEMP/bootstrap-import.yml"
+          git checkout --orphan imported-main
+          git rm -rf .
+          cp -a "$RUNNER_TEMP/personal-tool-source/." .
+          mkdir -p .github/workflows
+          cp "$RUNNER_TEMP/bootstrap-import.yml" .github/workflows/bootstrap-import.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "feat: build initial Windows focus and calendar app"
+          git push --force origin imported-main:main
