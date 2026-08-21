@@ -27,10 +27,23 @@ function createSnapshot(databaseId = 'database-1'): AppSnapshot {
   }
 }
 
+function createVerifiedSnapshot(databaseId = 'database-1'): AppSnapshot {
+  const snapshot = createSnapshot(databaseId)
+  Object.assign(snapshot.settings.notion, {
+    connected: true,
+    databaseName: 'Existing calendar',
+    titleProperty: 'Name',
+    dateProperty: 'When',
+    lastSyncedAt: '2026-08-20T00:00:00.000Z',
+    lastError: 'previous warning'
+  })
+  return snapshot
+}
+
 class MemoryStore {
   constructor(
     private snapshot: AppSnapshot,
-    private readonly token = 'secret-token'
+    private token = 'secret-token'
   ) {}
 
   async getSnapshot(): Promise<AppSnapshot> {
@@ -46,6 +59,13 @@ class MemoryStore {
 
   async getNotionToken(): Promise<string> {
     return this.token
+  }
+
+  async setNotionToken(token: string): Promise<void> {
+    this.token = token
+    await this.update((draft) => {
+      draft.settings.notion.tokenConfigured = true
+    })
   }
 }
 
@@ -80,6 +100,7 @@ function notionPage(id: string, title = 'Meeting'): Record<string, unknown> {
 }
 
 afterEach(() => {
+  vi.useRealTimers()
   vi.unstubAllGlobals()
 })
 
@@ -124,7 +145,306 @@ describe('Notion helpers', () => {
   })
 })
 
+describe('Notion connection failure policy', () => {
+  it.each([
+    ['network failure', () => { throw new TypeError('fetch failed') }, '暂时无法访问 Notion'],
+    [
+      'rate limit',
+      () => jsonResponse({ code: 'rate_limited', message: 'slow down' }, 429),
+      'Notion 请求过于频繁，请稍后重试。'
+    ],
+    [
+      'server failure',
+      () => jsonResponse({ code: 'internal_server_error', message: 'service unavailable' }, 500),
+      'Notion 同步失败：service unavailable'
+    ]
+  ] as const)(
+    'keeps an already verified connection after a temporary top-level %s',
+    async (_label, failure, expectedMessage) => {
+      vi.useFakeTimers()
+      const memoryStore = new MemoryStore(createVerifiedSnapshot())
+      const fetchMock = vi.fn(async () => failure())
+      vi.stubGlobal('fetch', fetchMock)
+      const operation = new NotionService(memoryStore as unknown as AppStore).syncAll()
+      const rejected = expect(operation).rejects.toThrow(expectedMessage)
+
+      await vi.runAllTimersAsync()
+      await rejected
+
+      const result = await memoryStore.getSnapshot()
+      expect(fetchMock).toHaveBeenCalledTimes(3)
+      expect(result.settings.notion.connected).toBe(true)
+      expect(result.settings.notion.databaseName).toBe('Existing calendar')
+      expect(result.settings.notion.lastError).toContain(expectedMessage)
+    }
+  )
+
+  it.each([
+    [401, 'Notion 密钥无效或已失效'],
+    [403, '该集成没有访问目标数据库的权限'],
+    [404, '找不到数据库']
+  ] as const)('invalidates the connection after HTTP %s', async (status, expectedMessage) => {
+    const memoryStore = new MemoryStore(createVerifiedSnapshot())
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => jsonResponse({ code: 'configuration_error', message: 'invalid connection' }, status))
+    )
+
+    await expect(new NotionService(memoryStore as unknown as AppStore).syncAll()).rejects.toThrow(expectedMessage)
+
+    const result = await memoryStore.getSnapshot()
+    expect(result.settings.notion.connected).toBe(false)
+    expect(result.settings.notion.databaseName).toBeUndefined()
+    expect(result.settings.notion.titleProperty).toBeUndefined()
+    expect(result.settings.notion.dateProperty).toBeUndefined()
+    expect(result.settings.notion.lastSyncedAt).toBeUndefined()
+    expect(result.settings.notion.lastError).toContain(expectedMessage)
+  })
+
+  it('invalidates the connection when the selected database schema is unusable', async () => {
+    const memoryStore = new MemoryStore(createVerifiedSnapshot())
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        jsonResponse({
+          id: 'database-1',
+          title: [{ plain_text: 'Broken calendar' }],
+          properties: { Name: { id: 'title', name: 'Name', type: 'title' } }
+        })
+      )
+    )
+
+    await expect(new NotionService(memoryStore as unknown as AppStore).syncAll()).rejects.toThrow(
+      '目标数据库需要至少包含一个标题属性和一个日期属性。'
+    )
+
+    const result = await memoryStore.getSnapshot()
+    expect(result.settings.notion.connected).toBe(false)
+    expect(result.settings.notion.databaseName).toBeUndefined()
+    expect(result.settings.notion.lastSyncedAt).toBeUndefined()
+    expect(result.settings.notion.lastError).toContain('目标数据库需要至少包含一个标题属性和一个日期属性。')
+  })
+})
+
+describe('Notion connection settings', () => {
+  it('preserves connection metadata and lastError when only auto-sync preferences change', async () => {
+    const memoryStore = new MemoryStore(createVerifiedSnapshot(DATABASE_A))
+    const service = new NotionService(memoryStore as unknown as AppStore)
+
+    const result = await service.saveSettings({
+      databaseId: DATABASE_A,
+      autoSyncPomodoros: false,
+      autoSyncManual: false
+    })
+
+    expect(result.settings.notion).toMatchObject({
+      connected: true,
+      databaseName: 'Existing calendar',
+      titleProperty: 'Name',
+      dateProperty: 'When',
+      lastSyncedAt: '2026-08-20T00:00:00.000Z',
+      lastError: 'previous warning',
+      autoSyncPomodoros: false,
+      autoSyncManual: false
+    })
+  })
+
+  it('clears connection metadata when the database changes', async () => {
+    const memoryStore = new MemoryStore(createVerifiedSnapshot(DATABASE_A))
+    const result = await new NotionService(memoryStore as unknown as AppStore).saveSettings({
+      databaseId: DATABASE_B,
+      autoSyncPomodoros: true,
+      autoSyncManual: true
+    })
+
+    expect(result.settings.notion.databaseId).toBe(DATABASE_B)
+    expect(result.settings.notion.connected).toBe(false)
+    expect(result.settings.notion.databaseName).toBeUndefined()
+    expect(result.settings.notion.titleProperty).toBeUndefined()
+    expect(result.settings.notion.dateProperty).toBeUndefined()
+    expect(result.settings.notion.lastSyncedAt).toBeUndefined()
+    expect(result.settings.notion.lastError).toBeUndefined()
+  })
+
+  it('clears connection metadata when a replacement token is supplied', async () => {
+    const memoryStore = new MemoryStore(createVerifiedSnapshot(DATABASE_A))
+    const result = await new NotionService(memoryStore as unknown as AppStore).saveSettings({
+      databaseId: DATABASE_A,
+      token: 'replacement-token',
+      autoSyncPomodoros: true,
+      autoSyncManual: true
+    })
+
+    expect(await memoryStore.getNotionToken()).toBe('replacement-token')
+    expect(result.settings.notion.connected).toBe(false)
+    expect(result.settings.notion.databaseName).toBeUndefined()
+    expect(result.settings.notion.titleProperty).toBeUndefined()
+    expect(result.settings.notion.dateProperty).toBeUndefined()
+    expect(result.settings.notion.lastSyncedAt).toBeUndefined()
+    expect(result.settings.notion.lastError).toBeUndefined()
+  })
+
+  it('does not hide queued work after a successful connection test', async () => {
+    const snapshot = createVerifiedSnapshot(DATABASE_A)
+    snapshot.notionDeletions.push({
+      id: 'queued-deletion',
+      entryId: 'deleted-entry',
+      notionPageId: 'deleted-page',
+      databaseId: DATABASE_A,
+      title: 'Deleted entry',
+      startAt: '2026-08-20T02:00:00.000Z',
+      endAt: '2026-08-20T03:00:00.000Z',
+      requestedAt: '2026-08-21T00:00:00.000Z'
+    })
+    const memoryStore = new MemoryStore(snapshot)
+    vi.stubGlobal('fetch', vi.fn(async () => databaseResponse(DATABASE_A)))
+
+    const result = await new NotionService(memoryStore as unknown as AppStore).testConnection({
+      databaseId: DATABASE_A
+    })
+
+    expect(result.ok).toBe(true)
+    expect((await memoryStore.getSnapshot()).settings.notion.lastError).toContain('1 条删除操作等待同步')
+  })
+})
+
+describe('Notion request retry boundaries', () => {
+  it('retries a transient database GET and then completes synchronization', async () => {
+    vi.useFakeTimers()
+    const memoryStore = new MemoryStore(createSnapshot())
+    let databaseRequests = 0
+    let queryRequests = 0
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL | Request) => {
+        const url = String(input)
+        if (url.endsWith('/databases/database-1')) {
+          databaseRequests += 1
+          if (databaseRequests === 1) throw new TypeError('temporary network failure')
+          return databaseResponse()
+        }
+        if (url.endsWith('/databases/database-1/query')) {
+          queryRequests += 1
+          return jsonResponse({ results: [], has_more: false })
+        }
+        throw new Error(`Unexpected request: ${url}`)
+      })
+    )
+
+    const operation = new NotionService(memoryStore as unknown as AppStore).syncAll()
+    await vi.runAllTimersAsync()
+    const result = await operation
+
+    expect(databaseRequests).toBe(2)
+    expect(queryRequests).toBe(1)
+    expect(result.settings.notion.connected).toBe(true)
+    expect(result.settings.notion.lastError).toBeUndefined()
+  })
+
+  it('retries a transient database query and then completes synchronization', async () => {
+    vi.useFakeTimers()
+    const memoryStore = new MemoryStore(createSnapshot())
+    let queryRequests = 0
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL | Request) => {
+        const url = String(input)
+        if (url.endsWith('/databases/database-1')) return databaseResponse()
+        if (url.endsWith('/databases/database-1/query')) {
+          queryRequests += 1
+          if (queryRequests === 1) {
+            return jsonResponse({ code: 'internal_server_error', message: 'retry query' }, 500)
+          }
+          return jsonResponse({ results: [], has_more: false })
+        }
+        throw new Error(`Unexpected request: ${url}`)
+      })
+    )
+
+    const operation = new NotionService(memoryStore as unknown as AppStore).syncAll()
+    await vi.runAllTimersAsync()
+    const result = await operation
+
+    expect(queryRequests).toBe(2)
+    expect(result.settings.notion.connected).toBe(true)
+    expect(result.settings.notion.lastError).toBeUndefined()
+  })
+
+  it('does not replay POST /pages after a network failure', async () => {
+    const snapshot = createSnapshot()
+    snapshot.entries.push({
+      id: 'pending-post',
+      kind: 'manual',
+      source: 'local',
+      title: 'Pending upload',
+      notes: '',
+      startAt: '2026-08-20T02:00:00.000Z',
+      endAt: '2026-08-20T03:00:00.000Z',
+      syncStatus: 'pending',
+      notionDatabaseId: 'database-1',
+      createdAt: '2026-08-20T00:00:00.000Z',
+      updatedAt: '2026-08-20T00:00:00.000Z'
+    })
+    const memoryStore = new MemoryStore(snapshot)
+    let postRequests = 0
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input)
+        if (url.endsWith('/databases/database-1')) return databaseResponse()
+        if (url.endsWith('/databases/database-1/query')) {
+          return jsonResponse({ results: [], has_more: false })
+        }
+        if (url.endsWith('/pages') && init?.method === 'POST') {
+          postRequests += 1
+          throw new TypeError('connection reset after request write')
+        }
+        throw new Error(`Unexpected request: ${url}`)
+      })
+    )
+
+    const result = await new NotionService(memoryStore as unknown as AppStore).syncAll()
+
+    expect(postRequests).toBe(1)
+    expect(result.entries[0]).toMatchObject({
+      id: 'pending-post',
+      syncStatus: 'error',
+      lastSyncError: '暂时无法访问 Notion，连接配置仍保留，应用将自动重试。'
+    })
+    expect(result.settings.notion.connected).toBe(true)
+    expect(result.settings.notion.lastError).toContain('1 条记录暂未同步')
+  })
+})
+
 describe('Notion deletion synchronization', () => {
+  it('keeps deletion intents when database access cannot be verified', async () => {
+    const snapshot = createVerifiedSnapshot()
+    snapshot.notionDeletions.push({
+      id: 'deletion-without-access',
+      entryId: 'entry-without-access',
+      notionPageId: 'page-without-access',
+      databaseId: 'database-1',
+      title: 'Protected meeting',
+      startAt: '2026-08-20T02:00:00.000Z',
+      endAt: '2026-08-20T03:00:00.000Z',
+      requestedAt: '2026-08-21T00:00:00.000Z'
+    })
+    const requestedUrls: string[] = []
+    const memoryStore = new MemoryStore(snapshot)
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL | Request) => {
+        requestedUrls.push(String(input))
+        return jsonResponse({ code: 'object_not_found', message: 'Database is not shared.' }, 404)
+      })
+    )
+
+    await expect(new NotionService(memoryStore as unknown as AppStore).syncAll()).rejects.toThrow('找不到数据库')
+
+    expect(requestedUrls.some((url) => url.includes('/pages/page-without-access'))).toBe(false)
+    expect((await memoryStore.getSnapshot()).notionDeletions).toHaveLength(1)
+  })
+
   it('treats a missing page as already deleted and prevents a stale pull from restoring it', async () => {
     const snapshot = createSnapshot()
     snapshot.notionDeletions.push({
@@ -160,6 +480,44 @@ describe('Notion deletion synchronization', () => {
     expect(archivedPages).toEqual(['page-1'])
     expect(result.notionDeletions).toEqual([])
     expect(result.entries).toEqual([])
+  })
+
+  it('treats Notion\'s already-archived validation response as an idempotent success', async () => {
+    const snapshot = createSnapshot()
+    snapshot.notionDeletions.push({
+      id: 'deletion-archived',
+      entryId: 'entry-archived',
+      notionPageId: 'page-archived',
+      title: 'Archived meeting',
+      startAt: '2026-08-20T02:00:00.000Z',
+      endAt: '2026-08-20T03:00:00.000Z',
+      requestedAt: '2026-08-21T00:00:00.000Z'
+    })
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input)
+        if (url.endsWith('/pages/page-archived') && init?.method === 'PATCH') {
+          return jsonResponse(
+            {
+              code: 'validation_error',
+              message: "Can't edit block that is archived. You must unarchive the block before editing."
+            },
+            400
+          )
+        }
+        if (url.endsWith('/databases/database-1')) return databaseResponse()
+        if (url.endsWith('/databases/database-1/query')) {
+          return jsonResponse({ results: [], has_more: false })
+        }
+        throw new Error(`Unexpected request: ${url}`)
+      })
+    )
+
+    const result = await new NotionService(new MemoryStore(snapshot) as unknown as AppStore).syncAll()
+
+    expect(result.notionDeletions).toEqual([])
+    expect(result.settings.notion.lastError).toBeUndefined()
   })
 
   it('queues and archives the page created after its local entry was deleted in flight', async () => {
@@ -219,6 +577,7 @@ describe('Notion deletion synchronization', () => {
   })
 
   it('keeps a failed archive in the durable queue for a later retry', async () => {
+    vi.useFakeTimers()
     const snapshot = createSnapshot()
     snapshot.notionDeletions.push({
       id: 'deletion-1',
@@ -246,13 +605,15 @@ describe('Notion deletion synchronization', () => {
     )
 
     const service = new NotionService(memoryStore as unknown as AppStore)
-    const result = await service.syncAll()
+    const operation = service.syncAll()
+    await vi.runAllTimersAsync()
+    const result = await operation
 
     expect(result.entries).toEqual([])
     expect(result.notionDeletions).toHaveLength(1)
     expect(result.notionDeletions[0]).toMatchObject({
       id: 'deletion-1',
-      lastError: 'network unavailable'
+      lastError: '暂时无法访问 Notion，连接配置仍保留，应用将自动重试。'
     })
     expect(result.notionDeletions[0]?.lastAttemptAt).toBeTruthy()
     expect(result.settings.notion.lastError).toContain('1 条删除操作等待同步')

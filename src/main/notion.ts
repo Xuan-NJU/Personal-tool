@@ -6,11 +6,14 @@ import type {
   NotionTestInput,
   NotionTestResult
 } from '../shared/types'
+import { classifyNotionError, planNotionRetry } from './notion-retry'
 import { AppStore } from './store'
 
 const NOTION_API = 'https://api.notion.com/v1'
 const NOTION_VERSION = '2022-06-28'
 const UNRESOLVED_DELETION_RETENTION_MS = 24 * 60 * 60_000
+const NOTION_REQUEST_TIMEOUT_MS = 20_000
+const NOTION_REQUEST_MAX_RETRIES = 2
 
 function formatDurationMs(durationMs: number): string {
   if (durationMs < 60_000) return `${Math.max(1, Math.round(durationMs / 1000))} 秒`
@@ -44,6 +47,8 @@ interface DatabaseInfo {
   dateProperty: string
 }
 
+type NotionFetch = (input: string, init?: RequestInit) => Promise<Response>
+
 class NotionRequestError extends Error {
   constructor(
     message: string,
@@ -52,6 +57,20 @@ class NotionRequestError extends Error {
   ) {
     super(message)
     this.name = 'NotionRequestError'
+  }
+}
+
+class NotionConfigurationError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'NotionConfigurationError'
+  }
+}
+
+class NotionTransportError extends Error {
+  constructor(message: string, cause: unknown) {
+    super(message, { cause })
+    this.name = 'NotionTransportError'
   }
 }
 
@@ -105,6 +124,66 @@ function isNotionNotFound(error: unknown): boolean {
   return error instanceof NotionRequestError && error.status === 404
 }
 
+function isNotionAlreadyArchived(error: unknown): boolean {
+  return (
+    error instanceof NotionRequestError &&
+    error.status === 400 &&
+    /already archived|can't edit (?:a )?block that is archived|must unarchive/i.test(error.message)
+  )
+}
+
+function pendingSyncMessage(snapshot: AppSnapshot, databaseId: string): string | undefined {
+  const queuedEntryCount = snapshot.entries.filter(
+    (entry) =>
+      (entry.syncStatus === 'pending' || entry.syncStatus === 'error') &&
+      (!entry.notionDatabaseId || entry.notionDatabaseId === databaseId)
+  ).length
+  const queuedDeletionCount = snapshot.notionDeletions.filter(
+    (deletion) => !deletion.databaseId || deletion.databaseId === databaseId
+  ).length
+  const messages = [
+    queuedEntryCount > 0 ? `${queuedEntryCount} 条记录暂未同步` : '',
+    queuedDeletionCount > 0 ? `${queuedDeletionCount} 条删除操作等待同步` : ''
+  ].filter(Boolean)
+  return messages.length > 0 ? `${messages.join('；')}，将在稍后重试。` : undefined
+}
+
+function invalidatesNotionConnection(error: unknown): boolean {
+  if (error instanceof NotionConfigurationError) return true
+  const category = classifyNotionError(error).category
+  return category === 'authentication' || category === 'permission' || category === 'configuration'
+}
+
+function hasVerifiedNotionConnection(snapshot: AppSnapshot): boolean {
+  const notion = snapshot.settings.notion
+  return Boolean(
+    notion.connected ||
+      (notion.databaseName && notion.titleProperty && notion.dateProperty && notion.lastSyncedAt)
+  )
+}
+
+function normalizeNotionRequestError(error: unknown, fromRequest = false): Error {
+  if (
+    error instanceof NotionRequestError ||
+    error instanceof NotionConfigurationError ||
+    error instanceof NotionTransportError
+  ) {
+    return error
+  }
+  const classification = classifyNotionError(error)
+  if (fromRequest && classification.category === 'timeout') {
+    return new NotionTransportError('连接 Notion 超时，连接配置仍保留，应用将自动重试。', error)
+  }
+  if (fromRequest && classification.category === 'network') {
+    return new NotionTransportError('暂时无法访问 Notion，连接配置仍保留，应用将自动重试。', error)
+  }
+  return error instanceof Error ? error : new Error('Notion 请求失败。')
+}
+
+function wait(durationMs: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, durationMs))
+}
+
 function notionError(status: number, payload: unknown): Error {
   const body = payload as { message?: string; code?: string }
   const suffix = body.message || body.code || `HTTP ${status}`
@@ -134,11 +213,11 @@ export function normalizeDatabaseId(input: string): string {
 }
 
 export function inspectDatabase(database: NotionDatabase): DatabaseInfo {
-  const properties = Object.entries(database.properties)
+  const properties = Object.entries(database?.properties ?? {})
   const titleProperty = properties.find(([, property]) => property.type === 'title')?.[0]
   const dateProperty = properties.find(([, property]) => property.type === 'date')?.[0]
   if (!titleProperty || !dateProperty) {
-    throw new Error('目标数据库需要至少包含一个标题属性和一个日期属性。')
+    throw new NotionConfigurationError('目标数据库需要至少包含一个标题属性和一个日期属性。')
   }
   const name = database.title?.map((item) => item.plain_text ?? '').join('').trim() || 'Notion 日历'
   return { id: database.id, name, titleProperty, dateProperty }
@@ -181,16 +260,41 @@ export function notionPageToEntry(page: NotionPage, info: DatabaseInfo): Calenda
 
 export class NotionService {
   private databaseRevision = 0
+  private settingsUpdatePromise: Promise<void> = Promise.resolve()
 
-  constructor(private readonly store: AppStore) {}
+  constructor(
+    private readonly store: AppStore,
+    private readonly fetcher: NotionFetch = (input, init) => globalThis.fetch(input, init)
+  ) {}
 
-  async saveSettings(input: NotionSettingsInput): Promise<AppSnapshot> {
+  saveSettings(input: NotionSettingsInput): Promise<AppSnapshot> {
+    // New syncs wait for this serialized update; a real token/database change
+    // advances the revision inside saveSettingsNow and invalidates old requests.
+    const operation = this.settingsUpdatePromise.then(() => this.saveSettingsNow(input))
+    this.settingsUpdatePromise = operation.then(
+      () => undefined,
+      () => undefined
+    )
+    return operation
+  }
+
+  async getSyncKey(): Promise<string> {
+    await this.settingsUpdatePromise
+    const snapshot = await this.store.getSnapshot()
+    return `${this.databaseRevision}:${snapshot.settings.notion.databaseId}`
+  }
+
+  private async saveSettingsNow(input: NotionSettingsInput): Promise<AppSnapshot> {
     const databaseId = input.databaseId.trim() ? normalizeDatabaseId(input.databaseId) : ''
-    if (input.token?.trim()) await this.store.setNotionToken(input.token)
-    let changedDatabase = false
+    const previous = await this.store.getSnapshot()
+    const changedDatabase = previous.settings.notion.databaseId !== databaseId
+    const changedToken = Boolean(input.token?.trim())
+    const changedConnection = changedDatabase || changedToken
+    if (changedConnection) this.databaseRevision += 1
+    if (changedToken) await this.store.setNotionToken(input.token as string)
+
     const snapshot = await this.store.update((draft) => {
       const previousDatabaseId = draft.settings.notion.databaseId
-      changedDatabase = previousDatabaseId !== databaseId
       bindLegacyNotionData(draft, previousDatabaseId || databaseId)
       if (changedDatabase && previousDatabaseId) {
         draft.entries = draft.entries.filter(
@@ -211,33 +315,39 @@ export class NotionService {
       draft.settings.notion.databaseId = databaseId
       draft.settings.notion.autoSyncPomodoros = input.autoSyncPomodoros
       draft.settings.notion.autoSyncManual = input.autoSyncManual
-      if (changedDatabase) {
+      if (changedConnection) {
         draft.settings.notion.connected = false
         draft.settings.notion.databaseName = undefined
         draft.settings.notion.titleProperty = undefined
         draft.settings.notion.dateProperty = undefined
+        draft.settings.notion.lastSyncedAt = undefined
+        draft.settings.notion.lastError = undefined
       }
-      draft.settings.notion.lastError = undefined
     })
-    if (changedDatabase) this.databaseRevision += 1
     return snapshot
   }
 
   async testConnection(input: NotionTestInput): Promise<NotionTestResult> {
+    await this.settingsUpdatePromise
+    const suppliedToken = input.token?.trim()
+    const testRevision = this.databaseRevision
+    let token = suppliedToken
     try {
-      const token = input.token?.trim() || (await this.store.getNotionToken())
-      if (!token) throw new Error('请先输入 Notion Internal Integration Token。')
+      token ||= await this.store.getNotionToken()
+      if (!token) throw new NotionConfigurationError('请先输入 Notion Internal Integration Token。')
       const databaseId = normalizeDatabaseId(input.databaseId)
       const info = await this.fetchDatabase(token, databaseId)
-      if (!input.token?.trim()) {
+      if (!suppliedToken) {
+        if (this.databaseRevision !== testRevision) throw new DatabaseChangedDuringSyncError()
         await this.store.update((draft) => {
-          if (draft.settings.notion.databaseId !== databaseId) return
+          if (this.databaseRevision !== testRevision || draft.settings.notion.databaseId !== databaseId) return
+          const pendingMessage = pendingSyncMessage(draft, databaseId)
           Object.assign(draft.settings.notion, {
             connected: true,
             databaseName: info.name,
             titleProperty: info.titleProperty,
             dateProperty: info.dateProperty,
-            lastError: undefined
+            lastError: pendingMessage
           })
         })
       }
@@ -248,9 +358,10 @@ export class NotionService {
         titleProperty: info.titleProperty,
         dateProperty: info.dateProperty
       }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : '连接测试失败。'
-      if (!input.token?.trim()) {
+    } catch (cause) {
+      const error = normalizeNotionRequestError(cause)
+      const message = error.message
+      if (!suppliedToken) {
         await this.store.update((draft) => {
           let databaseId: string | undefined
           try {
@@ -258,8 +369,22 @@ export class NotionService {
           } catch {
             databaseId = undefined
           }
-          if (databaseId && draft.settings.notion.databaseId === databaseId) {
-            draft.settings.notion.connected = false
+          if (
+            this.databaseRevision === testRevision &&
+            databaseId &&
+            draft.settings.notion.databaseId === databaseId
+          ) {
+            const verified = hasVerifiedNotionConnection(draft)
+            if (invalidatesNotionConnection(error)) {
+              draft.settings.notion.connected = false
+              draft.settings.notion.databaseName = undefined
+              draft.settings.notion.titleProperty = undefined
+              draft.settings.notion.dateProperty = undefined
+              draft.settings.notion.lastSyncedAt = undefined
+            } else if (verified) {
+              draft.settings.notion.connected = true
+            }
+            if (!token) draft.settings.notion.tokenConfigured = false
             draft.settings.notion.lastError = message
           }
         })
@@ -269,18 +394,22 @@ export class NotionService {
   }
 
   async syncAll(): Promise<AppSnapshot> {
+    await this.settingsUpdatePromise
     const syncRevision = this.databaseRevision
     const syncStartedAt = Date.now()
     const token = await this.store.getNotionToken()
     const before = await this.store.getSnapshot()
     const databaseId = before.settings.notion.databaseId
-    if (!token || !databaseId) throw new Error('请先在设置中连接 Notion 日历数据库。')
 
     try {
+      if (!databaseId) throw new NotionConfigurationError('请先在设置中选择 Notion 日历数据库。')
+      if (!token) throw new NotionConfigurationError('Notion 密钥不可用，请在设置中重新填写 Token。')
       await this.prepareDatabaseScope(databaseId, syncRevision)
-      const initialDeletionFlush = await this.flushPendingDeletions(token, databaseId, syncRevision)
       const info = await this.fetchDatabase(token, databaseId)
       await this.requireCurrentDatabase(databaseId, syncRevision)
+      // Validate database access before consuming deletion intents. Notion may
+      // report a page as 404 when permissions are missing, not only when deleted.
+      const initialDeletionFlush = await this.flushPendingDeletions(token, databaseId, syncRevision)
       const remoteEntries = await this.pullEntries(token, databaseId, info)
       await this.requireCurrentDatabase(databaseId, syncRevision)
       await this.resolvePendingDeletionPageIds(
@@ -342,38 +471,39 @@ export class NotionService {
 
       return this.store.update((draft) => {
         this.assertCurrentDatabase(draft, databaseId, syncRevision)
-        const failedEntryCount = draft.entries.filter(
-          (entry) => entry.notionDatabaseId === databaseId && entry.syncStatus === 'error'
-        ).length
-        const queuedDeletionCount = draft.notionDeletions.filter(
-          (deletion) => deletion.databaseId === databaseId
-        ).length
-        const pendingMessages = [
-          failedEntryCount > 0 ? `${failedEntryCount} 条记录暂未同步` : '',
-          queuedDeletionCount > 0 ? `${queuedDeletionCount} 条删除操作等待同步` : ''
-        ].filter(Boolean)
         Object.assign(draft.settings.notion, {
           connected: true,
           databaseName: info.name,
           titleProperty: info.titleProperty,
           dateProperty: info.dateProperty,
           lastSyncedAt: new Date().toISOString(),
-          lastError: pendingMessages.length > 0 ? `${pendingMessages.join('；')}，将在稍后重试。` : undefined
+          lastError: pendingSyncMessage(draft, databaseId)
         })
       })
-    } catch (error) {
+    } catch (cause) {
       const current = await this.store.getSnapshot()
       if (
-        error instanceof DatabaseChangedDuringSyncError ||
+        cause instanceof DatabaseChangedDuringSyncError ||
         this.databaseRevision !== syncRevision ||
         current.settings.notion.databaseId !== databaseId
       ) {
         return current
       }
-      const message = error instanceof Error ? error.message : 'Notion 同步失败。'
+      const error = normalizeNotionRequestError(cause)
+      const message = error.message
       await this.store.update((draft) => {
         this.assertCurrentDatabase(draft, databaseId, syncRevision)
-        draft.settings.notion.connected = false
+        const verified = hasVerifiedNotionConnection(draft)
+        if (invalidatesNotionConnection(error)) {
+          draft.settings.notion.connected = false
+          draft.settings.notion.databaseName = undefined
+          draft.settings.notion.titleProperty = undefined
+          draft.settings.notion.dateProperty = undefined
+          draft.settings.notion.lastSyncedAt = undefined
+        } else if (verified) {
+          draft.settings.notion.connected = true
+        }
+        if (!token) draft.settings.notion.tokenConfigured = false
         draft.settings.notion.lastError = message
       })
       throw error
@@ -409,8 +539,8 @@ export class NotionService {
     try {
       await this.request(token, `/pages/${pageId}`, { method: 'PATCH', body: { archived: true } })
     } catch (error) {
-      // Archiving is idempotent: a page that no longer exists already satisfies the deletion request.
-      if (!isNotionNotFound(error)) throw error
+      // Archiving is idempotent: missing and already-archived pages both satisfy the deletion request.
+      if (!isNotionNotFound(error) && !isNotionAlreadyArchived(error)) throw error
     }
   }
 
@@ -699,18 +829,36 @@ export class NotionService {
     path: string,
     options: { method?: 'GET' | 'POST' | 'PATCH'; body?: unknown } = {}
   ): Promise<unknown> {
-    const response = await fetch(`${NOTION_API}${path}`, {
-      method: options.method ?? 'GET',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Notion-Version': NOTION_VERSION,
-        'Content-Type': 'application/json'
-      },
-      body: options.body === undefined ? undefined : JSON.stringify(options.body),
-      signal: AbortSignal.timeout(20_000)
-    })
-    const payload = (await response.json().catch(() => ({}))) as unknown
-    if (!response.ok) throw notionError(response.status, payload)
-    return payload
+    const method = options.method ?? 'GET'
+    // Creating a page is not safely repeatable: a timeout may happen after Notion
+    // committed the page, so POST /pages is reconciled on the next pull instead.
+    const canRetry = method === 'GET' || method === 'PATCH' || path.endsWith('/query')
+    let retryNumber = 0
+
+    while (true) {
+      try {
+        const response = await this.fetcher(`${NOTION_API}${path}`, {
+          method,
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Notion-Version': NOTION_VERSION,
+            'Content-Type': 'application/json'
+          },
+          body: options.body === undefined ? undefined : JSON.stringify(options.body),
+          signal: AbortSignal.timeout(NOTION_REQUEST_TIMEOUT_MS)
+        })
+        const payload = (await response.json().catch(() => ({}))) as unknown
+        if (!response.ok) throw notionError(response.status, payload)
+        return payload
+      } catch (cause) {
+        const error = normalizeNotionRequestError(cause, true)
+        const retry = planNotionRetry(error, retryNumber, {
+          maxRetries: canRetry ? NOTION_REQUEST_MAX_RETRIES : 0
+        })
+        if (!retry.shouldRetry) throw error
+        await wait(retry.delayMs as number)
+        retryNumber += 1
+      }
+    }
   }
 }

@@ -31,6 +31,8 @@ export function CalendarPage({ snapshot, commitSnapshot, notify, onOpenSettings 
   const [selectedEntryId, setSelectedEntryId] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const notionConnected = snapshot.notion.connectionState !== 'disconnected';
+  const notionDegraded = snapshot.notion.connectionState === 'degraded';
   const days = useMemo(() => Array.from({ length: 7 }, (_, index) => addDays(weekStart, index)), [weekStart]);
   const selectedEntry = snapshot.entries.find((entry) => entry.id === selectedEntryId) ?? null;
   const weekEnd = addDays(weekStart, 7).getTime();
@@ -61,7 +63,19 @@ export function CalendarPage({ snapshot, commitSnapshot, notify, onOpenSettings 
     }
   };
 
-  const sync = () => void mutate('sync', () => personalToolApi().syncNotion(), '日历已经同步');
+  const sync = async () => {
+    setBusy('sync');
+    try {
+      const next = await personalToolApi().syncNotion();
+      commitSnapshot(next);
+      const partial = Boolean(next.settings.notion.lastError);
+      notify(partial ? '同步尚未完全完成，应用会在后台自动重试' : '日历已经同步', partial ? 'info' : 'success');
+    } catch (cause) {
+      notify(errorMessage(cause), 'error');
+    } finally {
+      setBusy(null);
+    }
+  };
   const removeSelected = async () => {
     if (!selectedEntry || !window.confirm(`确定删除“${selectedEntry.title}”吗？`)) return;
     const needsRemoteArchive = Boolean(selectedEntry.raw.notionPageId);
@@ -87,7 +101,7 @@ export function CalendarPage({ snapshot, commitSnapshot, notify, onOpenSettings 
         </div>
       </header>
 
-      {!snapshot.notion.connected && (
+      {!notionConnected && (
         <div className="info-banner">
           <span className="info-banner-icon"><Icon name="cloud-off" /></span>
           <div><strong>当前使用本地日历</strong><p>连接 Notion 数据库后，番茄钟和手动记录可以自动同步。</p></div>
@@ -97,8 +111,8 @@ export function CalendarPage({ snapshot, commitSnapshot, notify, onOpenSettings 
       {snapshot.notion.error && (
         <div className="error-banner" role="alert">
           <Icon name="info" />
-          <span><strong>部分记录同步失败</strong>{snapshot.notion.error}</span>
-          <button className="text-button" type="button" onClick={sync}>重试</button>
+          <span><strong>{notionDegraded ? '已连接，部分记录等待重试' : 'Notion 连接需要检查'}</strong>{snapshot.notion.error}</span>
+          <button className="text-button" type="button" onClick={notionConnected ? sync : onOpenSettings}>{notionConnected ? '重试' : '检查连接'}</button>
         </div>
       )}
 
@@ -113,7 +127,7 @@ export function CalendarPage({ snapshot, commitSnapshot, notify, onOpenSettings 
             <h2>{formatWeekRange(weekStart)}</h2>
           </div>
           <div className="calendar-toolbar-actions">
-            {snapshot.notion.connected && (
+            {notionConnected && (
               <button className="button button-secondary" type="button" disabled={busy === 'sync'} onClick={sync}>
                 {busy === 'sync' ? <Spinner /> : <Icon name="refresh" />} 同步
               </button>
@@ -173,7 +187,7 @@ export function CalendarPage({ snapshot, commitSnapshot, notify, onOpenSettings 
       <CreateEntryModal
         open={createOpen}
         busy={busy === 'create'}
-        autoSync={snapshot.notion.connected && snapshot.notion.autoSyncManual}
+        autoSync={notionConnected && snapshot.notion.autoSyncManual}
         onClose={() => setCreateOpen(false)}
         onCreate={async (input) => {
           const created = await mutate('create', () => personalToolApi().createEntry(input), '活动已经添加');

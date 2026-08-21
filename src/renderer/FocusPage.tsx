@@ -40,6 +40,8 @@ export function FocusPage({ snapshot, commitSnapshot, notify }: FocusPageProps) 
   const [durationOpen, setDurationOpen] = useState(false);
 
   const activeTimer = snapshot.activeTimer;
+  const notionConnected = snapshot.notion.connectionState !== 'disconnected';
+  const notionDegraded = snapshot.notion.connectionState === 'degraded';
   const selectedPreset = snapshot.presets.find((preset) => preset.id === selectedPresetId);
   const selectedDuration = selectedPreset?.durationSeconds ?? customDuration;
 
@@ -241,10 +243,10 @@ export function FocusPage({ snapshot, commitSnapshot, notify }: FocusPageProps) 
           {!activeTimer && (
             <div className="auto-record-row">
               <span>
-                <Icon name={snapshot.notion.connected ? 'cloud' : 'cloud-off'} size={18} />
-                <span><strong>完成后自动同步</strong><small>{snapshot.notion.connected ? '写入已连接的 Notion 数据库' : '连接 Notion 后即可自动写入'}</small></span>
+                <Icon name={notionConnected ? 'cloud' : 'cloud-off'} size={18} />
+                <span><strong>完成后自动同步</strong><small>{notionDegraded ? '连接已保留，恢复后会自动重试' : notionConnected ? '写入已连接的 Notion 数据库' : '连接 Notion 后即可自动写入'}</small></span>
               </span>
-              <Switch checked={autoSync} onChange={setAutoSync} label="完成后自动同步" disabled={!snapshot.notion.connected} />
+              <Switch checked={autoSync} onChange={setAutoSync} label="完成后自动同步" disabled={!notionConnected} />
             </div>
           )}
         </section>

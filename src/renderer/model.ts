@@ -37,6 +37,7 @@ export interface UiCalendarEntry {
 }
 
 export interface UiNotionSettings extends NotionSettings {
+  connectionState: 'disconnected' | 'connected' | 'degraded';
   status: 'disconnected' | 'idle' | 'synced' | 'error';
   error?: string;
 }
@@ -95,8 +96,26 @@ function normalizeEntry(entry: CalendarEntry): UiCalendarEntry | null {
   };
 }
 
+function notionConnectionState(notion: NotionSettings): UiNotionSettings['connectionState'] {
+  if (notion.connected) return notion.lastError ? 'degraded' : 'connected';
+
+  // Older snapshots marked every network/sync failure as disconnected. Preserve the
+  // last verified connection for retryable failures, while keeping credential,
+  // permission, and database errors in the disconnected state.
+  const connectionMustBeChecked = /密钥无效|已失效|没有访问目标数据库的权限|找不到数据库|\b(?:401|403|404)\b|unauthori[sz]ed|forbidden/i.test(
+    notion.lastError ?? '',
+  );
+  const wasVerified = Boolean(
+    notion.databaseId
+      && notion.tokenConfigured
+      && (notion.databaseName || notion.lastSyncedAt || (notion.titleProperty && notion.dateProperty)),
+  );
+  return notion.lastError && wasVerified && !connectionMustBeChecked ? 'degraded' : 'disconnected';
+}
+
 export function normalizeSnapshot(snapshot: AppSnapshot): UiSnapshot {
   const notion = snapshot.settings.notion;
+  const connectionState = notionConnectionState(notion);
   return {
     raw: snapshot,
     presets: snapshot.presets,
@@ -113,7 +132,8 @@ export function normalizeSnapshot(snapshot: AppSnapshot): UiSnapshot {
     ideas: [...(snapshot.ideas ?? [])].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)),
     notion: {
       ...notion,
-      status: !notion.connected ? 'disconnected' : notion.lastError ? 'error' : notion.lastSyncedAt ? 'synced' : 'idle',
+      connectionState,
+      status: connectionState === 'disconnected' ? 'disconnected' : notion.lastError ? 'error' : notion.lastSyncedAt ? 'synced' : 'idle',
       error: notion.lastError,
     },
   };

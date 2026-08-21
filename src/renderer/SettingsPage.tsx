@@ -26,13 +26,24 @@ export function SettingsPage({ snapshot, commitSnapshot, notify }: SettingsPageP
     setAutoSyncManual(snapshot.notion.autoSyncManual);
   }, [snapshot.notion.autoSyncManual, snapshot.notion.autoSyncPomodoros, snapshot.notion.databaseId]);
 
-  const connectionLabel = !snapshot.notion.connected
+  const notionConnected = snapshot.notion.connectionState !== 'disconnected';
+  const notionDegraded = snapshot.notion.connectionState === 'degraded';
+  const connectionLabel = notionDegraded
+    ? '已连接 · 同步异常'
+    : !notionConnected
     ? snapshot.notion.databaseId
       ? '需要检查连接'
       : '尚未连接'
-    : snapshot.notion.error
-      ? '同步遇到问题'
-      : '连接正常';
+    : '连接正常';
+  const connectionDescription = notionDegraded
+    ? snapshot.notion.databaseName
+      ? `已连接到“${snapshot.notion.databaseName}”；本地记录会安全保留，并在下次同步时重试。`
+      : '连接配置仍然保留；本地记录会安全保留，并在下次同步时重试。'
+    : snapshot.notion.databaseName
+      ? `当前数据库：${snapshot.notion.databaseName}`
+      : notionConnected
+        ? '已经可以发送番茄钟和手动活动记录。'
+        : '完成下方配置后，你的记录会同时保存在本机与 Notion。';
 
   const test = async () => {
     if (!databaseId.trim()) return;
@@ -81,8 +92,10 @@ export function SettingsPage({ snapshot, commitSnapshot, notify }: SettingsPageP
   const sync = async () => {
     setBusy('sync');
     try {
-      commitSnapshot(await personalToolApi().syncNotion());
-      notify('同步完成', 'success');
+      const next = await personalToolApi().syncNotion();
+      commitSnapshot(next);
+      const partial = Boolean(next.settings.notion.lastError);
+      notify(partial ? '同步尚未完全完成，应用会在后台自动重试' : '同步完成', partial ? 'info' : 'success');
     } catch (cause) {
       notify(errorMessage(cause), 'error');
     } finally {
@@ -100,29 +113,23 @@ export function SettingsPage({ snapshot, commitSnapshot, notify }: SettingsPageP
         </div>
       </header>
 
-      <div className={`status-card connection-status ${snapshot.notion.connected ? 'is-connected' : ''} ${snapshot.notion.error ? 'has-error' : ''}`}>
-        <span className="status-card-icon"><Icon name={snapshot.notion.connected && !snapshot.notion.error ? 'cloud' : 'cloud-off'} size={28} /></span>
+      <div className={`status-card connection-status ${notionConnected ? 'is-connected' : ''} ${snapshot.notion.error ? 'has-error' : ''}`}>
+        <span className="status-card-icon"><Icon name={notionConnected ? 'cloud' : 'cloud-off'} size={28} /></span>
         <div>
           <span className="status-kicker">NOTION 数据库</span>
           <h2>{connectionLabel}</h2>
-          <p>
-            {snapshot.notion.databaseName
-              ? `当前数据库：${snapshot.notion.databaseName}`
-              : snapshot.notion.connected
-                ? '已经可以发送番茄钟和手动活动记录。'
-                : '完成下方配置后，你的记录会同时保存在本机与 Notion。'}
-          </p>
+          <p>{connectionDescription}</p>
         </div>
         <div className="connection-meta">
           <span>{relativeSyncTime(toEpoch(snapshot.notion.lastSyncedAt))}</span>
-          {snapshot.notion.connected && <button className="button button-secondary" type="button" disabled={busy === 'sync'} onClick={sync}>{busy === 'sync' ? <Spinner /> : <Icon name="refresh" />}立即同步</button>}
+          {notionConnected && <button className="button button-secondary" type="button" disabled={busy === 'sync'} onClick={sync}>{busy === 'sync' ? <Spinner /> : <Icon name="refresh" />}立即同步</button>}
         </div>
       </div>
 
       {snapshot.notion.error && (
         <div className="error-banner" role="alert">
           <Icon name="info" />
-          <span><strong>最近一次同步没有完成</strong>{snapshot.notion.error}</span>
+          <span><strong>{notionDegraded ? '连接仍保留，最近一次同步没有完成' : 'Notion 连接需要检查'}</strong>{snapshot.notion.error}</span>
         </div>
       )}
 

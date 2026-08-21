@@ -75,12 +75,16 @@ export function App() {
 
   if (!snapshot) return null;
 
-  const syncClass = snapshot.notion.error ? 'is-error' : snapshot.notion.connected ? 'is-connected' : 'is-local';
-  const syncLabel = snapshot.notion.error
-    ? '同步需处理'
-    : snapshot.notion.connected
+  const notionConnected = snapshot.notion.connectionState !== 'disconnected';
+  const notionDegraded = snapshot.notion.connectionState === 'degraded';
+  const syncClass = notionDegraded ? 'is-error' : notionConnected ? 'is-connected' : snapshot.notion.error ? 'is-error' : 'is-local';
+  const syncLabel = notionDegraded
+    ? '已连接 · 等待重试'
+    : notionConnected
       ? relativeSyncTime(snapshot.notion.lastSyncedAt ? Date.parse(snapshot.notion.lastSyncedAt) : undefined)
-      : '仅本地';
+      : snapshot.notion.error
+        ? '连接需检查'
+        : '仅本地';
   const pageTitle = pages.find((item) => item.id === page)?.label ?? '小番茄';
   const miniSeconds = timerDisplaySeconds(snapshot.activeTimer, now);
   const localDataPage = page === 'planner' || page === 'ideas';
@@ -110,8 +114,11 @@ export function App() {
         <div className="sidebar-spacer" />
         <div className="sidebar-footer">
           <button className={`sidebar-sync ${syncClass}`} type="button" onClick={() => setPage('settings')}>
-            <span className="sidebar-sync-icon"><Icon name={snapshot.notion.connected ? 'cloud' : 'cloud-off'} size={18} /></span>
-            <span><strong>{snapshot.notion.connected ? snapshot.notion.databaseName || 'Notion 已连接' : 'Notion 未连接'}</strong><small>{syncLabel}</small></span>
+            <span className="sidebar-sync-icon"><Icon name={notionConnected ? 'cloud' : 'cloud-off'} size={18} /></span>
+            <span>
+              <strong>{notionConnected ? snapshot.notion.databaseName || 'Notion 已连接' : snapshot.notion.databaseId ? 'Notion 待验证' : 'Notion 未连接'}</strong>
+              <small>{syncLabel}</small>
+            </span>
           </button>
           <p className="version-label">小番茄 · 本地优先</p>
         </div>

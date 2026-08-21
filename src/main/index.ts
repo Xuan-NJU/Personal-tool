@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, Menu, nativeImage, Notification, session, Tray } from 'electron'
+import { app, BrowserWindow, ipcMain, Menu, nativeImage, net, Notification, powerMonitor, session, Tray } from 'electron'
 import { join } from 'node:path'
 import type {
   AppSnapshot,
@@ -20,6 +20,7 @@ import {
   saveTodo as saveTodoMutation,
   toggleTodo as toggleTodoMutation
 } from './content'
+import { shouldRunNotionBackgroundSync } from './notion-background-sync'
 import { NotionService } from './notion'
 import { AppStore } from './store'
 
@@ -28,9 +29,12 @@ let tray: Tray | null = null
 let isQuitting = false
 let finishingTimer = false
 let syncPromise: Promise<AppSnapshot> | null = null
+let syncPromiseKey: string | null = null
 
 const store = new AppStore(process.env.PERSONAL_TOOL_DATA_DIR)
-const notion = new NotionService(store)
+// Chromium's network stack follows the user's Windows proxy and certificate
+// configuration more reliably than Node's built-in fetch in packaged Electron.
+const notion = new NotionService(store, (input, init) => net.fetch(input, init))
 
 function notifyRenderer(snapshot: AppSnapshot): void {
   for (const window of BrowserWindow.getAllWindows()) {
@@ -386,12 +390,32 @@ function syncInBackground(): void {
     .catch(() => broadcastCurrent())
 }
 
-function syncNow(): Promise<AppSnapshot> {
-  if (syncPromise) return syncPromise
-  syncPromise = notion.syncAll().finally(() => {
-    syncPromise = null
-  })
-  return syncPromise
+async function syncConfiguredNotionInBackground(): Promise<void> {
+  const snapshot = await store.getSnapshot()
+  if (snapshot.settings.notion.tokenConfigured && snapshot.settings.notion.databaseId) {
+    syncInBackground()
+  }
+}
+
+async function syncNow(): Promise<AppSnapshot> {
+  let requestedKey = await notion.getSyncKey()
+  while (syncPromise) {
+    if (syncPromiseKey === requestedKey) return syncPromise
+    await syncPromise.catch(() => undefined)
+    requestedKey = await notion.getSyncKey()
+  }
+
+  const promise = notion.syncAll()
+  syncPromise = promise
+  syncPromiseKey = requestedKey
+  try {
+    return await promise
+  } finally {
+    if (syncPromise === promise) {
+      syncPromise = null
+      syncPromiseKey = null
+    }
+  }
 }
 
 function registerIpc(): void {
@@ -456,23 +480,15 @@ if (!gotLock) {
 
     setInterval(async () => {
       const snapshot = await store.getSnapshot()
-      const notionSettings = snapshot.settings.notion
-      const hasQueuedEntries = snapshot.entries.some(
-        (entry) =>
-          ['pending', 'error'].includes(entry.syncStatus) &&
-          (!entry.notionDatabaseId || entry.notionDatabaseId === notionSettings.databaseId)
-      )
-      const hasQueuedDeletions = snapshot.notionDeletions.some(
-        (deletion) => !deletion.databaseId || deletion.databaseId === notionSettings.databaseId
-      )
-      if (
-        notionSettings.tokenConfigured &&
-        notionSettings.databaseId &&
-        (hasQueuedEntries || hasQueuedDeletions)
-      ) {
-        syncInBackground()
-      }
+      if (shouldRunNotionBackgroundSync(snapshot, Date.now())) syncInBackground()
     }, 60_000).unref()
+
+    // Revalidate shortly after launch so an old transient "fetch failed" state
+    // heals without asking the user to re-enter credentials.
+    setTimeout(() => void syncConfiguredNotionInBackground(), 3_000).unref()
+    powerMonitor.on('resume', () => {
+      setTimeout(() => void syncConfiguredNotionInBackground(), 3_000).unref()
+    })
 
     app.on('activate', () => {
       if (!mainWindow || mainWindow.isDestroyed()) mainWindow = createMainWindow()
