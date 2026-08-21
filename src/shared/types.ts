@@ -3,6 +3,8 @@ export type TimerStatus = 'running' | 'paused'
 export type EntryKind = 'pomodoro' | 'manual' | 'external'
 export type EntrySource = 'local' | 'notion'
 export type SyncStatus = 'local' | 'pending' | 'synced' | 'error'
+export type TodoPriority = 'low' | 'medium' | 'high'
+export type ResearchIdeaStatus = 'seed' | 'exploring' | 'validated' | 'archived'
 
 export interface Preset {
   id: string
@@ -39,9 +41,45 @@ export interface CalendarEntry {
   timerMode?: TimerMode
   syncStatus: SyncStatus
   notionPageId?: string
+  notionDatabaseId?: string
   lastSyncError?: string
   createdAt: string
   updatedAt: string
+}
+
+export interface DailyTodo {
+  id: string
+  dateKey: string
+  title: string
+  notes: string
+  priority: TodoPriority
+  completed: boolean
+  completedAt?: string
+  createdAt: string
+  updatedAt: string
+}
+
+export interface ResearchIdea {
+  id: string
+  title: string
+  summary: string
+  tags: string[]
+  status: ResearchIdeaStatus
+  createdAt: string
+  updatedAt: string
+}
+
+export interface NotionDeletion {
+  id: string
+  entryId: string
+  notionPageId?: string
+  databaseId?: string
+  title: string
+  startAt: string
+  endAt: string
+  requestedAt: string
+  lastAttemptAt?: string
+  lastError?: string
 }
 
 export interface NotionSettings {
@@ -66,6 +104,9 @@ export interface AppSnapshot {
   presets: Preset[]
   activeTimer: TimerSession | null
   entries: CalendarEntry[]
+  todos: DailyTodo[]
+  ideas: ResearchIdea[]
+  notionDeletions: NotionDeletion[]
   settings: AppSettings
 }
 
@@ -89,6 +130,22 @@ export interface ManualEntryInput {
   notes: string
   startAt: string
   endAt: string
+}
+
+export interface DailyTodoInput {
+  id?: string
+  dateKey: string
+  title: string
+  notes: string
+  priority: TodoPriority
+}
+
+export interface ResearchIdeaInput {
+  id?: string
+  title: string
+  summary: string
+  tags: string[]
+  status: ResearchIdeaStatus
 }
 
 export interface NotionSettingsInput {
@@ -122,6 +179,11 @@ export interface PersonalToolAPI {
   deletePreset(id: string): Promise<AppSnapshot>
   createEntry(input: ManualEntryInput): Promise<AppSnapshot>
   deleteEntry(id: string): Promise<AppSnapshot>
+  saveTodo(input: DailyTodoInput): Promise<AppSnapshot>
+  toggleTodo(id: string): Promise<AppSnapshot>
+  deleteTodo(id: string): Promise<AppSnapshot>
+  saveIdea(input: ResearchIdeaInput): Promise<AppSnapshot>
+  deleteIdea(id: string): Promise<AppSnapshot>
   updateNotionSettings(input: NotionSettingsInput): Promise<AppSnapshot>
   testNotion(input: NotionTestInput): Promise<NotionTestResult>
   syncNotion(): Promise<AppSnapshot>

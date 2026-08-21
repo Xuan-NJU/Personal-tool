@@ -43,23 +43,34 @@ export function CalendarPage({ snapshot, commitSnapshot, notify, onOpenSettings 
     if (scrollRef.current) scrollRef.current.scrollTop = HOUR_HEIGHT * 7.5;
   }, []);
 
-  const mutate = async (key: string, action: () => ReturnType<ReturnType<typeof personalToolApi>['getSnapshot']>, success?: string) => {
+  const mutate = async (
+    key: string,
+    action: () => ReturnType<ReturnType<typeof personalToolApi>['getSnapshot']>,
+    success?: string,
+  ): Promise<boolean> => {
     setBusy(key);
     try {
       commitSnapshot(await action());
       if (success) notify(success, 'success');
+      return true;
     } catch (cause) {
       notify(errorMessage(cause), 'error');
+      return false;
     } finally {
       setBusy(null);
     }
   };
 
-  const sync = () => mutate('sync', () => personalToolApi().syncNotion(), '日历已经同步');
+  const sync = () => void mutate('sync', () => personalToolApi().syncNotion(), '日历已经同步');
   const removeSelected = async () => {
     if (!selectedEntry || !window.confirm(`确定删除“${selectedEntry.title}”吗？`)) return;
-    await mutate('delete', () => personalToolApi().deleteEntry(selectedEntry.id), '活动记录已删除');
-    setSelectedEntryId(null);
+    const needsRemoteArchive = Boolean(selectedEntry.raw.notionPageId);
+    const removed = await mutate(
+      'delete',
+      () => personalToolApi().deleteEntry(selectedEntry.id),
+      needsRemoteArchive ? '已从本地移除，将在后台同步到 Notion' : '活动记录已删除',
+    );
+    if (removed) setSelectedEntryId(null);
   };
 
   return (
@@ -112,7 +123,7 @@ export function CalendarPage({ snapshot, commitSnapshot, notify, onOpenSettings 
         </div>
 
         <div className={`calendar-content ${selectedEntry ? 'has-detail' : ''}`}>
-          <div className="calendar-grid" ref={scrollRef} role="grid" aria-label={`${formatWeekRange(weekStart)}周视图`}>
+          <div className="calendar-grid" ref={scrollRef} aria-label={`${formatWeekRange(weekStart)}周视图`}>
             <div className="week-header">
               <div className="week-corner" />
               {days.map((day) => {
@@ -145,19 +156,19 @@ export function CalendarPage({ snapshot, commitSnapshot, notify, onOpenSettings 
               onDelete={removeSelected}
             />
           )}
+
+          {!weekEntries.length && (
+            <div className="calendar-empty-overlay">
+              <EmptyState
+                icon="calendar"
+                title="这一周还很宽阔"
+                description="开始一次专注，或补记一段已经完成的事情。"
+                action={<button className="button button-secondary" type="button" onClick={() => setCreateOpen(true)}><Icon name="plus" /> 添加活动</button>}
+              />
+            </div>
+          )}
         </div>
       </section>
-
-      {!weekEntries.length && (
-        <div className="calendar-empty-overlay">
-          <EmptyState
-            icon="calendar"
-            title="这一周还很宽阔"
-            description="开始一次专注，或补记一段已经完成的事情。"
-            action={<button className="button button-secondary" type="button" onClick={() => setCreateOpen(true)}><Icon name="plus" /> 添加活动</button>}
-          />
-        </div>
-      )}
 
       <CreateEntryModal
         open={createOpen}
@@ -165,8 +176,8 @@ export function CalendarPage({ snapshot, commitSnapshot, notify, onOpenSettings 
         autoSync={snapshot.notion.connected && snapshot.notion.autoSyncManual}
         onClose={() => setCreateOpen(false)}
         onCreate={async (input) => {
-          await mutate('create', () => personalToolApi().createEntry(input), '活动已经添加');
-          setCreateOpen(false);
+          const created = await mutate('create', () => personalToolApi().createEntry(input), '活动已经添加');
+          if (created) setCreateOpen(false);
         }}
       />
     </div>
@@ -180,7 +191,7 @@ function DayColumn({ day, entries, selectedEntryId, onSelect }: { day: Date; ent
   const dayEntries = entries.filter((entry) => entry.endAt > start.getTime() && entry.startAt < end.getTime());
 
   return (
-    <div className={`day-column ${sameDay(day, Date.now()) ? 'is-today' : ''}`} role="gridcell">
+    <div className={`day-column ${sameDay(day, Date.now()) ? 'is-today' : ''}`}>
       {HOURS.map((hour) => <div className="hour-cell" key={hour} style={{ height: HOUR_HEIGHT }} />)}
       {dayEntries.map((entry) => {
         const visibleStart = Math.max(entry.startAt, start.getTime());
@@ -224,11 +235,12 @@ function EventDetail({ entry, deleting, onClose, onDelete }: { entry: UiCalendar
         <Icon name={entry.syncStatus === 'error' ? 'cloud-off' : 'cloud'} size={18} />
         <span><strong>{statusLabel}</strong>{entry.syncError && <small>{entry.syncError}</small>}</span>
       </div>
-      {entry.source !== 'remote' && (
-        <button className="button button-danger detail-delete" type="button" disabled={deleting} onClick={onDelete}>
-          {deleting ? <Spinner /> : <Icon name="trash" />} 删除记录
-        </button>
+      {entry.raw.notionPageId && (
+        <p className="detail-delete-note">删除后会在 Notion 中归档；离线时会自动排队，联网后重试。</p>
       )}
+      <button className="button button-danger detail-delete" type="button" disabled={deleting} onClick={onDelete}>
+        {deleting ? <Spinner /> : <Icon name="trash" />} 删除记录
+      </button>
     </aside>
   );
 }

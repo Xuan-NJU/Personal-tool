@@ -34,6 +34,29 @@ export function addDays(date: Date, amount: number): Date {
   return next;
 }
 
+export function toDateKey(date: Date): string {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+export function dateFromKey(value: string): Date {
+  const [year, month, day] = value.split('-').map(Number);
+  if (!year || !month || !day) return new Date();
+  return new Date(year, month - 1, day, 12, 0, 0, 0);
+}
+
+export function formatPlannerDate(date: Date): string {
+  const includeYear = date.getFullYear() !== new Date().getFullYear();
+  return new Intl.DateTimeFormat('zh-CN', {
+    ...(includeYear ? { year: 'numeric' as const } : {}),
+    month: 'long',
+    day: 'numeric',
+    weekday: 'long',
+  }).format(date);
+}
+
 export function sameDay(left: Date | number, right: Date | number): boolean {
   const a = new Date(left);
   const b = new Date(right);
@@ -82,4 +105,19 @@ export function relativeSyncTime(value?: number): string {
   if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前同步`;
   if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} 小时前同步`;
   return `${Math.floor(diff / 86_400_000)} 天前同步`;
+}
+
+export function formatUpdatedTime(value: string | number): string {
+  const timestamp = typeof value === 'number' ? value : Date.parse(value);
+  if (!Number.isFinite(timestamp)) return '更新时间未知';
+  const diff = Date.now() - timestamp;
+  if (diff >= 0 && diff < 60_000) return '刚刚更新';
+  if (diff >= 0 && diff < 3_600_000) return `${Math.max(1, Math.floor(diff / 60_000))} 分钟前更新`;
+  if (sameDay(timestamp, Date.now())) return `今天 ${formatClock(timestamp)} 更新`;
+  if (sameDay(timestamp, addDays(new Date(), -1))) return `昨天 ${formatClock(timestamp)} 更新`;
+  return new Intl.DateTimeFormat('zh-CN', {
+    year: new Date(timestamp).getFullYear() === new Date().getFullYear() ? undefined : 'numeric',
+    month: 'short',
+    day: 'numeric',
+  }).format(timestamp);
 }

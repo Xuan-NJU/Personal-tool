@@ -3,7 +3,14 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import type { AppSnapshot } from '../shared/types'
 
-const DATA_VERSION = 1
+const DATA_VERSION = 2
+
+export class UnsupportedDataVersionError extends Error {
+  constructor(readonly dataVersion: number) {
+    super(`数据文件来自更新版本（v${dataVersion}），当前应用无法安全打开。请使用更新版本的 Personal Tool。`)
+    this.name = 'UnsupportedDataVersionError'
+  }
+}
 
 function nowIso(): string {
   return new Date().toISOString()
@@ -41,6 +48,9 @@ function defaultSnapshot(): AppSnapshot {
     ],
     activeTimer: null,
     entries: [],
+    todos: [],
+    ideas: [],
+    notionDeletions: [],
     settings: {
       notion: {
         databaseId: '',
@@ -57,6 +67,9 @@ function normalizeSnapshot(value: Partial<AppSnapshot>): AppSnapshot {
   const defaults = defaultSnapshot()
   const presets = Array.isArray(value.presets) && value.presets.length > 0 ? value.presets : defaults.presets
   const entries = Array.isArray(value.entries) ? value.entries : []
+  const todos = Array.isArray(value.todos) ? value.todos : []
+  const ideas = Array.isArray(value.ideas) ? value.ideas : []
+  const notionDeletions = Array.isArray(value.notionDeletions) ? value.notionDeletions : []
   const notion = value.settings?.notion
 
   return {
@@ -64,6 +77,9 @@ function normalizeSnapshot(value: Partial<AppSnapshot>): AppSnapshot {
     presets,
     activeTimer: value.activeTimer ?? null,
     entries,
+    todos,
+    ideas,
+    notionDeletions,
     settings: {
       notion: {
         ...defaults.settings.notion,
@@ -86,19 +102,32 @@ export class AppStore {
 
   async initialize(): Promise<void> {
     await mkdir(dirname(this.dataFile), { recursive: true })
+    let shouldPersist = false
     try {
       const raw = await readFile(this.dataFile, 'utf8')
-      this.data = normalizeSnapshot(JSON.parse(raw) as Partial<AppSnapshot>)
+      const parsed = JSON.parse(raw) as Partial<AppSnapshot>
+      if (typeof parsed.version === 'number' && parsed.version > DATA_VERSION) {
+        throw new UnsupportedDataVersionError(parsed.version)
+      }
+      const normalized = normalizeSnapshot(parsed)
+      this.data = normalized
+      shouldPersist =
+        parsed.version !== DATA_VERSION ||
+        !Array.isArray(parsed.todos) ||
+        !Array.isArray(parsed.ideas) ||
+        !Array.isArray(parsed.notionDeletions)
     } catch (error) {
+      if (error instanceof UnsupportedDataVersionError) throw error
       const code = (error as NodeJS.ErrnoException).code
       if (code !== 'ENOENT') {
         const backup = `${this.dataFile}.corrupt-${Date.now()}`
         await rename(this.dataFile, backup).catch(() => undefined)
       }
       this.data = defaultSnapshot()
-      await this.persist()
+      shouldPersist = true
     }
 
+    if (shouldPersist) await this.persist()
     this.data.settings.notion.tokenConfigured = Boolean(await this.readEncryptedToken())
   }
 
@@ -113,9 +142,9 @@ export class AppStore {
       const draft = structuredClone(this.data)
       await mutator(draft)
       draft.version = DATA_VERSION
+      await this.persist(draft)
       this.data = draft
-      await this.persist()
-      result = structuredClone(this.data)
+      result = structuredClone(draft)
     })
     this.queue = operation.catch(() => undefined)
     await operation
@@ -154,8 +183,8 @@ export class AppStore {
     }
   }
 
-  private async persist(): Promise<void> {
-    await this.atomicWrite(this.dataFile, JSON.stringify(this.data, null, 2))
+  private async persist(snapshot = this.data): Promise<void> {
+    await this.atomicWrite(this.dataFile, JSON.stringify(snapshot, null, 2))
   }
 
   private async atomicWrite(path: string, contents: string): Promise<void> {

@@ -2,10 +2,12 @@ import { contextBridge, ipcRenderer } from 'electron'
 import type {
   AppSnapshot,
   ManualEntryInput,
+  DailyTodoInput,
   NotionSettingsInput,
   NotionTestInput,
   PersonalToolAPI,
   PresetInput,
+  ResearchIdeaInput,
   TimerStartInput
 } from '../shared/types'
 
@@ -20,6 +22,11 @@ const api: PersonalToolAPI = {
   deletePreset: (id: string) => ipcRenderer.invoke('preset:delete', id),
   createEntry: (input: ManualEntryInput) => ipcRenderer.invoke('entry:create', input),
   deleteEntry: (id: string) => ipcRenderer.invoke('entry:delete', id),
+  saveTodo: (input: DailyTodoInput) => ipcRenderer.invoke('todo:save', input),
+  toggleTodo: (id: string) => ipcRenderer.invoke('todo:toggle', id),
+  deleteTodo: (id: string) => ipcRenderer.invoke('todo:delete', id),
+  saveIdea: (input: ResearchIdeaInput) => ipcRenderer.invoke('idea:save', input),
+  deleteIdea: (id: string) => ipcRenderer.invoke('idea:delete', id),
   updateNotionSettings: (input: NotionSettingsInput) => ipcRenderer.invoke('notion:update-settings', input),
   testNotion: (input: NotionTestInput) => ipcRenderer.invoke('notion:test', input),
   syncNotion: () => ipcRenderer.invoke('notion:sync'),

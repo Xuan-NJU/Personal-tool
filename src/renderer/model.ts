@@ -1,14 +1,16 @@
 import type {
   AppSnapshot,
   CalendarEntry,
+  DailyTodo,
   NotionSettings,
   Preset,
+  ResearchIdea,
   TimerMode,
   TimerSession,
 } from '../shared/types';
 import { elapsedMs, remainingMs } from '../shared/timer';
 
-export type { AppSnapshot, CalendarEntry, NotionSettings, Preset, TimerMode, TimerSession };
+export type { AppSnapshot, CalendarEntry, DailyTodo, NotionSettings, Preset, ResearchIdea, TimerMode, TimerSession };
 
 export interface UiTimerSession {
   raw: TimerSession;
@@ -44,6 +46,8 @@ export interface UiSnapshot {
   presets: Preset[];
   activeTimer: UiTimerSession | null;
   entries: UiCalendarEntry[];
+  todos: DailyTodo[];
+  ideas: ResearchIdea[];
   notion: UiNotionSettings;
 }
 
@@ -101,6 +105,12 @@ export function normalizeSnapshot(snapshot: AppSnapshot): UiSnapshot {
       .map(normalizeEntry)
       .filter((entry): entry is UiCalendarEntry => Boolean(entry))
       .sort((a, b) => a.startAt - b.startAt),
+    todos: [...(snapshot.todos ?? [])].sort((a, b) => {
+      if (a.completed !== b.completed) return Number(a.completed) - Number(b.completed);
+      const priority = { high: 0, medium: 1, low: 2 } as const;
+      return priority[a.priority] - priority[b.priority] || a.createdAt.localeCompare(b.createdAt);
+    }),
+    ideas: [...(snapshot.ideas ?? [])].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)),
     notion: {
       ...notion,
       status: !notion.connected ? 'disconnected' : notion.lastError ? 'error' : notion.lastSyncedAt ? 'synced' : 'idle',

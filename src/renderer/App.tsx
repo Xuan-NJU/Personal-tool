@@ -1,19 +1,23 @@
 import { useEffect, useState } from 'react';
 import { errorMessage, personalToolApi } from './api';
 import { CalendarPage } from './CalendarPage';
-import { EmptyState, Icon, Spinner } from './components';
+import { EmptyState, Icon, Spinner, type IconName } from './components';
 import { FocusPage } from './FocusPage';
 import { formatTimer, relativeSyncTime } from './format';
+import { IdeasPage } from './IdeasPage';
+import { PlannerPage } from './PlannerPage';
 import { SettingsPage } from './SettingsPage';
 import { timerDisplaySeconds } from './model';
 import type { NoticeKind } from './ui-types';
 import { useAppSnapshot } from './useAppSnapshot';
 
-type PageName = 'focus' | 'calendar' | 'settings';
+type PageName = 'focus' | 'planner' | 'calendar' | 'ideas' | 'settings';
 
-const pages: Array<{ id: PageName; label: string; icon: 'timer' | 'calendar' | 'settings' }> = [
+const pages: Array<{ id: PageName; label: string; icon: IconName }> = [
   { id: 'focus', label: '专注', icon: 'timer' },
+  { id: 'planner', label: '规划', icon: 'list-check' },
   { id: 'calendar', label: '日历', icon: 'calendar' },
+  { id: 'ideas', label: '灵感', icon: 'lightbulb' },
   { id: 'settings', label: '设置', icon: 'settings' },
 ];
 
@@ -79,9 +83,11 @@ export function App() {
       : '仅本地';
   const pageTitle = pages.find((item) => item.id === page)?.label ?? '小番茄';
   const miniSeconds = timerDisplaySeconds(snapshot.activeTimer, now);
+  const localDataPage = page === 'planner' || page === 'ideas';
+  const showMiniTimer = Boolean(snapshot.activeTimer && page !== 'focus');
 
   return (
-    <div className={`app-shell ${snapshot.activeTimer ? 'has-mini-timer' : ''}`}>
+    <div className={`app-shell ${showMiniTimer ? 'has-mini-timer' : ''}`}>
       <aside className="sidebar">
         <div className="brand">
           <span className="brand-icon" aria-hidden="true"><span>小</span><i /></span>
@@ -115,39 +121,49 @@ export function App() {
         <header className="topbar">
           <div className="topbar-title"><span className="mobile-brand-mark">小</span><strong>{pageTitle}</strong></div>
           <div className="topbar-actions">
-            <button className={`sync-pill ${syncClass}`} type="button" onClick={() => setPage('settings')}>
-              <span className="sync-dot" />
-              {syncLabel}
-            </button>
+            {localDataPage ? (
+              <span className="sync-pill is-local-storage" role="status" title="规划与灵感仅保存在这台电脑上">
+                已保存到本机
+              </span>
+            ) : (
+              <button className={`sync-pill ${syncClass}`} type="button" title="查看 Notion 日历连接" onClick={() => setPage('settings')}>
+                {syncLabel}
+              </button>
+            )}
           </div>
         </header>
 
-        <main className="content">
+        <main className="content" aria-busy={loading}>
           {error && <div className="error-banner app-error" role="alert"><Icon name="info" /><span><strong>数据刷新失败</strong>{error}</span><button className="text-button" type="button" onClick={reload}>重试</button></div>}
           {page === 'focus' && <FocusPage snapshot={snapshot} commitSnapshot={commitSnapshot} notify={notify} />}
+          {page === 'planner' && <PlannerPage snapshot={snapshot} commitSnapshot={commitSnapshot} notify={notify} />}
           {page === 'calendar' && <CalendarPage snapshot={snapshot} commitSnapshot={commitSnapshot} notify={notify} onOpenSettings={() => setPage('settings')} />}
+          {page === 'ideas' && <IdeasPage snapshot={snapshot} commitSnapshot={commitSnapshot} notify={notify} />}
           {page === 'settings' && <SettingsPage snapshot={snapshot} commitSnapshot={commitSnapshot} notify={notify} />}
         </main>
       </div>
 
-      {snapshot.activeTimer && page !== 'focus' && (
-        <div className="mini-timer" role="region" aria-label="正在进行的计时">
-          <button className="mini-timer-main" type="button" onClick={() => setPage('focus')}>
-            <span className={`mini-timer-pulse ${snapshot.activeTimer.status === 'paused' ? 'is-paused' : ''}`} />
-            <span><strong>{snapshot.activeTimer.title}</strong><small>{snapshot.activeTimer.status === 'paused' ? '已暂停' : snapshot.activeTimer.mode === 'countdown' ? '剩余时间' : '正向计时'}</small></span>
-          </button>
-          <time>{formatTimer(miniSeconds)}</time>
-          <button className="button button-icon mini-timer-toggle" type="button" disabled={miniBusy} aria-label={snapshot.activeTimer.status === 'running' ? '暂停计时' : '继续计时'} onClick={miniToggle}>
-            {miniBusy ? <Spinner /> : <Icon name={snapshot.activeTimer.status === 'running' ? 'pause' : 'play'} />}
-          </button>
-        </div>
-      )}
-
-      {notice && (
-        <div className={`toast toast-${notice.kind}`} role={notice.kind === 'error' ? 'alert' : 'status'}>
-          <span className="toast-icon"><Icon name={notice.kind === 'success' ? 'check' : notice.kind === 'error' ? 'info' : 'sparkle'} /></span>
-          <span>{notice.message}</span>
-          <button className="button button-icon" type="button" aria-label="关闭提示" onClick={() => setNotice(null)}><Icon name="close" size={17} /></button>
+      {(showMiniTimer || notice) && (
+        <div className="floating-stack">
+          {notice && (
+            <div className={`toast toast-${notice.kind}`} role={notice.kind === 'error' ? 'alert' : 'status'}>
+              <span className="toast-icon"><Icon name={notice.kind === 'success' ? 'check' : notice.kind === 'error' ? 'info' : 'sparkle'} /></span>
+              <span>{notice.message}</span>
+              <button className="button button-icon" type="button" aria-label="关闭提示" onClick={() => setNotice(null)}><Icon name="close" size={17} /></button>
+            </div>
+          )}
+          {showMiniTimer && snapshot.activeTimer && (
+            <div className="mini-timer" role="region" aria-label="正在进行的计时">
+              <button className="mini-timer-main" type="button" onClick={() => setPage('focus')}>
+                <span className={`mini-timer-pulse ${snapshot.activeTimer.status === 'paused' ? 'is-paused' : ''}`} />
+                <span><strong>{snapshot.activeTimer.title}</strong><small>{snapshot.activeTimer.status === 'paused' ? '已暂停' : snapshot.activeTimer.mode === 'countdown' ? '剩余时间' : '正向计时'}</small></span>
+              </button>
+              <time>{formatTimer(miniSeconds)}</time>
+              <button className="button button-icon mini-timer-toggle" type="button" disabled={miniBusy} aria-label={snapshot.activeTimer.status === 'running' ? '暂停计时' : '继续计时'} onClick={miniToggle}>
+                {miniBusy ? <Spinner /> : <Icon name={snapshot.activeTimer.status === 'running' ? 'pause' : 'play'} />}
+              </button>
+            </div>
+          )}
         </div>
       )}
     </div>

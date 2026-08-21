@@ -1,6 +1,7 @@
 import type {
   AppSnapshot,
   CalendarEntry,
+  NotionDeletion,
   NotionSettingsInput,
   NotionTestInput,
   NotionTestResult
@@ -9,6 +10,7 @@ import { AppStore } from './store'
 
 const NOTION_API = 'https://api.notion.com/v1'
 const NOTION_VERSION = '2022-06-28'
+const UNRESOLVED_DELETION_RETENTION_MS = 24 * 60 * 60_000
 
 function formatDurationMs(durationMs: number): string {
   if (durationMs < 60_000) return `${Math.max(1, Math.round(durationMs / 1000))} 秒`
@@ -42,14 +44,83 @@ interface DatabaseInfo {
   dateProperty: string
 }
 
+class NotionRequestError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly code?: string
+  ) {
+    super(message)
+    this.name = 'NotionRequestError'
+  }
+}
+
+class DatabaseChangedDuringSyncError extends Error {
+  constructor() {
+    super('Notion 数据库已变更，已放弃本轮旧数据库的同步结果。')
+    this.name = 'DatabaseChangedDuringSyncError'
+  }
+}
+
+interface DeletionFlushResult {
+  attemptedDeletionIds: Set<string>
+  deletedPageIds: Set<string>
+}
+
+function deletionMatchesEntry(
+  deletion: NotionDeletion,
+  entry: CalendarEntry,
+  databaseId: string
+): boolean {
+  if (deletion.databaseId !== databaseId || entry.notionDatabaseId !== databaseId) return false
+  if (deletion.entryId === entry.id) return true
+  if (deletion.notionPageId && entry.notionPageId) return deletion.notionPageId === entry.notionPageId
+  return (
+    !deletion.notionPageId &&
+    deletion.title === entry.title &&
+    deletion.startAt === entry.startAt &&
+    deletion.endAt === entry.endAt
+  )
+}
+
+function bindLegacyNotionData(snapshot: AppSnapshot, databaseId: string): void {
+  if (!databaseId) return
+  for (const entry of snapshot.entries) {
+    if (
+      !entry.notionDatabaseId &&
+      (entry.source === 'notion' ||
+        Boolean(entry.notionPageId) ||
+        entry.syncStatus === 'pending' ||
+        entry.syncStatus === 'error')
+    ) {
+      entry.notionDatabaseId = databaseId
+    }
+  }
+  for (const deletion of snapshot.notionDeletions) {
+    deletion.databaseId ??= databaseId
+  }
+}
+
+function isNotionNotFound(error: unknown): boolean {
+  return error instanceof NotionRequestError && error.status === 404
+}
+
 function notionError(status: number, payload: unknown): Error {
   const body = payload as { message?: string; code?: string }
   const suffix = body.message || body.code || `HTTP ${status}`
-  if (status === 401) return new Error(`Notion 密钥无效或已失效：${suffix}`)
-  if (status === 403) return new Error(`该集成没有访问目标数据库的权限：${suffix}`)
-  if (status === 404) return new Error(`找不到数据库。请确认数据库 ID，并把数据库共享给该集成：${suffix}`)
-  if (status === 429) return new Error('Notion 请求过于频繁，请稍后重试。')
-  return new Error(`Notion 同步失败：${suffix}`)
+  if (status === 401) return new NotionRequestError(`Notion 密钥无效或已失效：${suffix}`, status, body.code)
+  if (status === 403) {
+    return new NotionRequestError(`该集成没有访问目标数据库的权限：${suffix}`, status, body.code)
+  }
+  if (status === 404) {
+    return new NotionRequestError(
+      `找不到数据库。请确认数据库 ID，并把数据库共享给该集成：${suffix}`,
+      status,
+      body.code
+    )
+  }
+  if (status === 429) return new NotionRequestError('Notion 请求过于频繁，请稍后重试。', status, body.code)
+  return new NotionRequestError(`Notion 同步失败：${suffix}`, status, body.code)
 }
 
 export function normalizeDatabaseId(input: string): string {
@@ -102,19 +173,41 @@ export function notionPageToEntry(page: NotionPage, info: DatabaseInfo): Calenda
     endAt: new Date(Number.isFinite(endMs) && endMs > startMs ? endMs : startMs + 30 * 60_000).toISOString(),
     syncStatus: 'synced',
     notionPageId: page.id,
+    notionDatabaseId: info.id,
     createdAt: page.created_time,
     updatedAt: page.last_edited_time
   }
 }
 
 export class NotionService {
+  private databaseRevision = 0
+
   constructor(private readonly store: AppStore) {}
 
   async saveSettings(input: NotionSettingsInput): Promise<AppSnapshot> {
     const databaseId = input.databaseId.trim() ? normalizeDatabaseId(input.databaseId) : ''
     if (input.token?.trim()) await this.store.setNotionToken(input.token)
-    return this.store.update((draft) => {
-      const changedDatabase = draft.settings.notion.databaseId !== databaseId
+    let changedDatabase = false
+    const snapshot = await this.store.update((draft) => {
+      const previousDatabaseId = draft.settings.notion.databaseId
+      changedDatabase = previousDatabaseId !== databaseId
+      bindLegacyNotionData(draft, previousDatabaseId || databaseId)
+      if (changedDatabase && previousDatabaseId) {
+        draft.entries = draft.entries.filter(
+          (entry) => !(entry.source === 'notion' && entry.notionDatabaseId === previousDatabaseId)
+        )
+        const now = new Date().toISOString()
+        for (const entry of draft.entries) {
+          if (
+            entry.notionDatabaseId === previousDatabaseId &&
+            (entry.syncStatus === 'pending' || entry.syncStatus === 'error')
+          ) {
+            entry.syncStatus = 'local'
+            delete entry.lastSyncError
+            entry.updatedAt = now
+          }
+        }
+      }
       draft.settings.notion.databaseId = databaseId
       draft.settings.notion.autoSyncPomodoros = input.autoSyncPomodoros
       draft.settings.notion.autoSyncManual = input.autoSyncManual
@@ -126,6 +219,8 @@ export class NotionService {
       }
       draft.settings.notion.lastError = undefined
     })
+    if (changedDatabase) this.databaseRevision += 1
+    return snapshot
   }
 
   async testConnection(input: NotionTestInput): Promise<NotionTestResult> {
@@ -174,42 +269,110 @@ export class NotionService {
   }
 
   async syncAll(): Promise<AppSnapshot> {
+    const syncRevision = this.databaseRevision
+    const syncStartedAt = Date.now()
     const token = await this.store.getNotionToken()
     const before = await this.store.getSnapshot()
     const databaseId = before.settings.notion.databaseId
     if (!token || !databaseId) throw new Error('请先在设置中连接 Notion 日历数据库。')
 
     try {
+      await this.prepareDatabaseScope(databaseId, syncRevision)
+      const initialDeletionFlush = await this.flushPendingDeletions(token, databaseId, syncRevision)
       const info = await this.fetchDatabase(token, databaseId)
+      await this.requireCurrentDatabase(databaseId, syncRevision)
       const remoteEntries = await this.pullEntries(token, databaseId, info)
-      await this.reconcilePendingEntries(remoteEntries)
-      await this.pushPendingEntries(token, databaseId, info, await this.store.getSnapshot())
-      const afterPush = await this.store.getSnapshot()
-      const failedCount = afterPush.entries.filter((entry) => entry.syncStatus === 'error').length
-      return this.store.update((draft) => {
+      await this.requireCurrentDatabase(databaseId, syncRevision)
+      await this.resolvePendingDeletionPageIds(
+        remoteEntries,
+        initialDeletionFlush.deletedPageIds,
+        databaseId,
+        syncRevision
+      )
+      await this.reconcilePendingEntries(
+        remoteEntries,
+        initialDeletionFlush.deletedPageIds,
+        databaseId,
+        syncRevision
+      )
+      await this.pushPendingEntries(
+        token,
+        databaseId,
+        info,
+        await this.requireCurrentDatabase(databaseId, syncRevision),
+        syncRevision
+      )
+
+      await this.store.update((draft) => {
+        this.assertCurrentDatabase(draft, databaseId, syncRevision)
+        const activeDeletions = draft.notionDeletions.filter((deletion) => deletion.databaseId === databaseId)
+        draft.entries = draft.entries.filter(
+          (entry) =>
+            entry.notionDatabaseId !== databaseId ||
+            (!(entry.notionPageId && initialDeletionFlush.deletedPageIds.has(entry.notionPageId)) &&
+              !activeDeletions.some((deletion) => deletionMatchesEntry(deletion, entry, databaseId)))
+        )
         const byPageId = new Map(
-          draft.entries.filter((entry) => entry.notionPageId).map((entry) => [entry.notionPageId as string, entry])
+          draft.entries
+            .filter((entry) => entry.notionDatabaseId === databaseId && entry.notionPageId)
+            .map((entry) => [entry.notionPageId as string, entry])
         )
         for (const remote of remoteEntries) {
-          const existing = byPageId.get(remote.notionPageId as string)
+          const pageId = remote.notionPageId
+          if (
+            !pageId ||
+            initialDeletionFlush.deletedPageIds.has(pageId) ||
+            activeDeletions.some((deletion) => deletionMatchesEntry(deletion, remote, databaseId))
+          ) {
+            continue
+          }
+          const existing = byPageId.get(pageId)
           if (!existing) {
             draft.entries.push(remote)
           } else if (existing.source === 'notion') {
             Object.assign(existing, remote)
           }
         }
+      })
+
+      await this.flushPendingDeletions(token, databaseId, syncRevision, {
+        expireUnresolvedBefore: syncStartedAt - UNRESOLVED_DELETION_RETENTION_MS,
+        skipDeletionIds: initialDeletionFlush.attemptedDeletionIds
+      })
+
+      return this.store.update((draft) => {
+        this.assertCurrentDatabase(draft, databaseId, syncRevision)
+        const failedEntryCount = draft.entries.filter(
+          (entry) => entry.notionDatabaseId === databaseId && entry.syncStatus === 'error'
+        ).length
+        const queuedDeletionCount = draft.notionDeletions.filter(
+          (deletion) => deletion.databaseId === databaseId
+        ).length
+        const pendingMessages = [
+          failedEntryCount > 0 ? `${failedEntryCount} 条记录暂未同步` : '',
+          queuedDeletionCount > 0 ? `${queuedDeletionCount} 条删除操作等待同步` : ''
+        ].filter(Boolean)
         Object.assign(draft.settings.notion, {
           connected: true,
           databaseName: info.name,
           titleProperty: info.titleProperty,
           dateProperty: info.dateProperty,
           lastSyncedAt: new Date().toISOString(),
-          lastError: failedCount > 0 ? `有 ${failedCount} 条记录暂未同步，将在稍后重试。` : undefined
+          lastError: pendingMessages.length > 0 ? `${pendingMessages.join('；')}，将在稍后重试。` : undefined
         })
       })
     } catch (error) {
+      const current = await this.store.getSnapshot()
+      if (
+        error instanceof DatabaseChangedDuringSyncError ||
+        this.databaseRevision !== syncRevision ||
+        current.settings.notion.databaseId !== databaseId
+      ) {
+        return current
+      }
       const message = error instanceof Error ? error.message : 'Notion 同步失败。'
       await this.store.update((draft) => {
+        this.assertCurrentDatabase(draft, databaseId, syncRevision)
         draft.settings.notion.connected = false
         draft.settings.notion.lastError = message
       })
@@ -217,10 +380,132 @@ export class NotionService {
     }
   }
 
+  private assertCurrentDatabase(snapshot: AppSnapshot, databaseId: string, revision: number): void {
+    if (this.databaseRevision !== revision || snapshot.settings.notion.databaseId !== databaseId) {
+      throw new DatabaseChangedDuringSyncError()
+    }
+  }
+
+  private async requireCurrentDatabase(databaseId: string, revision: number): Promise<AppSnapshot> {
+    const snapshot = await this.store.getSnapshot()
+    this.assertCurrentDatabase(snapshot, databaseId, revision)
+    return snapshot
+  }
+
+  private async prepareDatabaseScope(databaseId: string, revision: number): Promise<void> {
+    await this.store.update((draft) => {
+      this.assertCurrentDatabase(draft, databaseId, revision)
+      bindLegacyNotionData(draft, databaseId)
+    })
+  }
+
   async archivePage(pageId: string): Promise<void> {
     const token = await this.store.getNotionToken()
     if (!token) throw new Error('Notion 密钥不可用，无法删除已同步的记录。')
-    await this.request(token, `/pages/${pageId}`, { method: 'PATCH', body: { archived: true } })
+    await this.archivePageWithToken(token, pageId)
+  }
+
+  private async archivePageWithToken(token: string, pageId: string): Promise<void> {
+    try {
+      await this.request(token, `/pages/${pageId}`, { method: 'PATCH', body: { archived: true } })
+    } catch (error) {
+      // Archiving is idempotent: a page that no longer exists already satisfies the deletion request.
+      if (!isNotionNotFound(error)) throw error
+    }
+  }
+
+  private async flushPendingDeletions(
+    token: string,
+    databaseId: string,
+    revision: number,
+    options: { expireUnresolvedBefore?: number; skipDeletionIds?: ReadonlySet<string> } = {}
+  ): Promise<DeletionFlushResult> {
+    const attemptedDeletionIds = new Set<string>()
+    const deletedPageIds = new Set<string>()
+    const snapshot = await this.requireCurrentDatabase(databaseId, revision)
+
+    for (const deletion of snapshot.notionDeletions) {
+      if (deletion.databaseId !== databaseId) continue
+      if (options.skipDeletionIds?.has(deletion.id)) continue
+      const pageId = deletion.notionPageId
+      if (!pageId) {
+        const requestedAt = Date.parse(deletion.requestedAt)
+        if (
+          options.expireUnresolvedBefore !== undefined &&
+          Number.isFinite(requestedAt) &&
+          requestedAt <= options.expireUnresolvedBefore
+        ) {
+          await this.store.update((draft) => {
+            this.assertCurrentDatabase(draft, databaseId, revision)
+            const current = draft.notionDeletions.find((candidate) => candidate.id === deletion.id)
+            if (current && current.databaseId === databaseId && !current.notionPageId) {
+              draft.notionDeletions = draft.notionDeletions.filter((candidate) => candidate.id !== deletion.id)
+            }
+          })
+        }
+        continue
+      }
+
+      attemptedDeletionIds.add(deletion.id)
+      const lastAttemptAt = new Date().toISOString()
+      try {
+        await this.requireCurrentDatabase(databaseId, revision)
+        await this.archivePageWithToken(token, pageId)
+        deletedPageIds.add(pageId)
+        await this.store.update((draft) => {
+          draft.notionDeletions = draft.notionDeletions.filter(
+            (candidate) =>
+              candidate.id !== deletion.id &&
+              !(candidate.databaseId === databaseId && candidate.notionPageId === pageId)
+          )
+        })
+      } catch (error) {
+        if (error instanceof DatabaseChangedDuringSyncError) throw error
+        const message = error instanceof Error ? error.message : 'Notion 删除同步失败。'
+        await this.store.update((draft) => {
+          const current = draft.notionDeletions.find((candidate) => candidate.id === deletion.id)
+          if (current && current.databaseId === databaseId && current.notionPageId === pageId) {
+            current.lastAttemptAt = lastAttemptAt
+            current.lastError = message
+          }
+        })
+      }
+    }
+
+    return { attemptedDeletionIds, deletedPageIds }
+  }
+
+  private async resolvePendingDeletionPageIds(
+    remoteEntries: CalendarEntry[],
+    excludedPageIds: ReadonlySet<string>,
+    databaseId: string,
+    revision: number
+  ): Promise<void> {
+    await this.store.update((draft) => {
+      this.assertCurrentDatabase(draft, databaseId, revision)
+      const claimed = new Set(
+        draft.notionDeletions.flatMap((deletion) =>
+          deletion.databaseId === databaseId && deletion.notionPageId ? [deletion.notionPageId] : []
+        )
+      )
+      for (const deletion of draft.notionDeletions) {
+        if (deletion.databaseId !== databaseId || deletion.notionPageId) continue
+        const match = remoteEntries.find(
+          (remote) =>
+            remote.notionDatabaseId === databaseId &&
+            remote.notionPageId &&
+            !claimed.has(remote.notionPageId) &&
+            !excludedPageIds.has(remote.notionPageId) &&
+            deletionMatchesEntry(deletion, remote, databaseId)
+        )
+        if (match?.notionPageId) {
+          deletion.notionPageId = match.notionPageId
+          deletion.lastAttemptAt = undefined
+          deletion.lastError = undefined
+          claimed.add(match.notionPageId)
+        }
+      }
+    })
   }
 
   private async fetchDatabase(token: string, databaseId: string): Promise<DatabaseInfo> {
@@ -232,13 +517,19 @@ export class NotionService {
     token: string,
     databaseId: string,
     info: DatabaseInfo,
-    snapshot: AppSnapshot
+    snapshot: AppSnapshot,
+    revision: number
   ): Promise<void> {
     const pending = snapshot.entries.filter(
-      (entry) => entry.source === 'local' && !entry.notionPageId && ['pending', 'error'].includes(entry.syncStatus)
+      (entry) =>
+        entry.source === 'local' &&
+        entry.notionDatabaseId === databaseId &&
+        !entry.notionPageId &&
+        ['pending', 'error'].includes(entry.syncStatus)
     )
     for (const [index, entry] of pending.entries()) {
       try {
+        await this.requireCurrentDatabase(databaseId, revision)
         const focusDetails =
           entry.kind === 'pomodoro'
             ? [
@@ -275,19 +566,53 @@ export class NotionService {
         }
         const page = (await this.request(token, '/pages', { method: 'POST', body: payload })) as NotionPage
         await this.store.update((draft) => {
-          const current = draft.entries.find((candidate) => candidate.id === entry.id)
-          if (current) {
+          const databaseStillCurrent =
+            this.databaseRevision === revision && draft.settings.notion.databaseId === databaseId
+          const current = draft.entries.find(
+            (candidate) => candidate.id === entry.id && candidate.notionDatabaseId === databaseId
+          )
+          const deletion = draft.notionDeletions.find(
+            (candidate) =>
+              candidate.entryId === entry.id &&
+              (!candidate.databaseId || candidate.databaseId === databaseId)
+          )
+          if (current && !deletion) {
             current.notionPageId = page.id
-            current.syncStatus = 'synced'
+            current.syncStatus = databaseStillCurrent ? 'synced' : 'local'
             current.lastSyncError = undefined
             current.updatedAt = new Date().toISOString()
+          } else if (deletion) {
+            deletion.databaseId ??= databaseId
+            deletion.notionPageId = page.id
+            deletion.lastAttemptAt = undefined
+            deletion.lastError = undefined
+          } else {
+            // The entry was deleted while its POST was in flight. Queue a compensating archive
+            // so the freshly-created Notion page cannot return on the next pull.
+            draft.notionDeletions.push({
+              id: crypto.randomUUID(),
+              entryId: entry.id,
+              notionPageId: page.id,
+              databaseId,
+              title: entry.title,
+              startAt: entry.startAt,
+              endAt: entry.endAt,
+              requestedAt: new Date().toISOString()
+            })
           }
         })
       } catch (error) {
+        if (error instanceof DatabaseChangedDuringSyncError) throw error
         const message = error instanceof Error ? error.message : '上传失败。'
         await this.store.update((draft) => {
-          const current = draft.entries.find((candidate) => candidate.id === entry.id)
-          if (current) {
+          const current = draft.entries.find(
+            (candidate) => candidate.id === entry.id && candidate.notionDatabaseId === databaseId
+          )
+          if (
+            current &&
+            this.databaseRevision === revision &&
+            draft.settings.notion.databaseId === databaseId
+          ) {
             current.syncStatus = 'error'
             current.lastSyncError = message
           }
@@ -297,14 +622,23 @@ export class NotionService {
     }
   }
 
-  private async reconcilePendingEntries(remoteEntries: CalendarEntry[]): Promise<void> {
+  private async reconcilePendingEntries(
+    remoteEntries: CalendarEntry[],
+    excludedPageIds: ReadonlySet<string>,
+    databaseId: string,
+    revision: number
+  ): Promise<void> {
     await this.store.update((draft) => {
+      this.assertCurrentDatabase(draft, databaseId, revision)
       const claimed = new Set(
-        draft.entries.flatMap((entry) => (entry.notionPageId ? [entry.notionPageId] : []))
+        draft.entries.flatMap((entry) =>
+          entry.notionDatabaseId === databaseId && entry.notionPageId ? [entry.notionPageId] : []
+        )
       )
       for (const local of draft.entries) {
         if (
           local.source !== 'local' ||
+          local.notionDatabaseId !== databaseId ||
           local.notionPageId ||
           !['pending', 'error'].includes(local.syncStatus)
         ) {
@@ -312,14 +646,20 @@ export class NotionService {
         }
         const match = remoteEntries.find(
           (remote) =>
+            remote.notionDatabaseId === databaseId &&
             remote.notionPageId &&
+            !excludedPageIds.has(remote.notionPageId) &&
             !claimed.has(remote.notionPageId) &&
+            !draft.notionDeletions.some((deletion) =>
+              deletionMatchesEntry(deletion, remote, databaseId)
+            ) &&
             remote.title === local.title &&
             remote.startAt === local.startAt &&
             remote.endAt === local.endAt
         )
         if (match?.notionPageId) {
           local.notionPageId = match.notionPageId
+          local.notionDatabaseId = databaseId
           local.syncStatus = 'synced'
           local.lastSyncError = undefined
           claimed.add(match.notionPageId)
@@ -331,16 +671,24 @@ export class NotionService {
   private async pullEntries(token: string, databaseId: string, info: DatabaseInfo): Promise<CalendarEntry[]> {
     const result: CalendarEntry[] = []
     let cursor: string | undefined
-    for (let pageIndex = 0; pageIndex < 5; pageIndex += 1) {
+    const seenCursors = new Set<string>()
+    while (true) {
       const payload = (await this.request(token, `/databases/${databaseId}/query`, {
         method: 'POST',
         body: { page_size: 100, start_cursor: cursor }
       })) as { results?: NotionPage[]; has_more?: boolean; next_cursor?: string | null }
       for (const page of payload.results ?? []) {
         const entry = notionPageToEntry(page, info)
-        if (entry) result.push(entry)
+        if (entry) {
+          entry.notionDatabaseId = databaseId
+          result.push(entry)
+        }
       }
       if (!payload.has_more || !payload.next_cursor) break
+      if (seenCursors.has(payload.next_cursor)) {
+        throw new Error('Notion 返回了重复的分页游标，同步已安全停止。')
+      }
+      seenCursors.add(payload.next_cursor)
       cursor = payload.next_cursor
     }
     return result

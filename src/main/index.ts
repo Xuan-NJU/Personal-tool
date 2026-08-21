@@ -3,13 +3,23 @@ import { join } from 'node:path'
 import type {
   AppSnapshot,
   CalendarEntry,
+  DailyTodoInput,
   ManualEntryInput,
   NotionSettingsInput,
   NotionTestInput,
   PresetInput,
+  ResearchIdeaInput,
   TimerStartInput
 } from '../shared/types'
 import { elapsedMs, isTimerDue } from '../shared/timer'
+import {
+  deleteCalendarEntry,
+  deleteIdea as deleteIdeaMutation,
+  deleteTodo as deleteTodoMutation,
+  saveIdea as saveIdeaMutation,
+  saveTodo as saveTodoMutation,
+  toggleTodo as toggleTodoMutation
+} from './content'
 import { NotionService } from './notion'
 import { AppStore } from './store'
 
@@ -36,11 +46,11 @@ function createMainWindow(): BrowserWindow {
   const window = new BrowserWindow({
     width: 1180,
     height: 780,
-    minWidth: 920,
+    minWidth: 760,
     minHeight: 640,
     show: false,
     title: 'Personal Tool',
-    backgroundColor: '#f7f8f4',
+    backgroundColor: '#f7f5f1',
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       contextIsolation: true,
@@ -199,6 +209,7 @@ async function finishTimer(automatic: boolean): Promise<AppSnapshot> {
         plannedDurationMs: timer.plannedDurationMs ?? undefined,
         timerMode: timer.mode,
         syncStatus: shouldSync ? 'pending' : 'local',
+        ...(shouldSync ? { notionDatabaseId: notionSettings.databaseId } : {}),
         createdAt: now,
         updatedAt: now
       }
@@ -293,6 +304,7 @@ async function createEntry(input: ManualEntryInput): Promise<AppSnapshot> {
       startAt: new Date(startMs).toISOString(),
       endAt: new Date(endMs).toISOString(),
       syncStatus: shouldSync ? 'pending' : 'local',
+      ...(shouldSync ? { notionDatabaseId: notionSettings.databaseId } : {}),
       createdAt: now,
       updatedAt: now
     })
@@ -304,13 +316,65 @@ async function createEntry(input: ManualEntryInput): Promise<AppSnapshot> {
 }
 
 async function deleteEntry(id: string): Promise<AppSnapshot> {
-  const before = await store.getSnapshot()
-  const entry = before.entries.find((candidate) => candidate.id === id)
-  if (!entry) return before
-  if (entry.source === 'notion') throw new Error('Notion 中原有的活动目前为只读，请在 Notion 中修改。')
-  if (entry.notionPageId) await notion.archivePage(entry.notionPageId)
+  let removed: CalendarEntry | undefined
   const snapshot = await store.update((draft) => {
-    draft.entries = draft.entries.filter((entry) => entry.id !== id)
+    removed = deleteCalendarEntry(draft, id)
+    if (removed && !removed.notionPageId && removed.syncStatus === 'local') {
+      // A never-synced local entry has no remote side effect to retry.
+      draft.notionDeletions = draft.notionDeletions.filter((deletion) => deletion.entryId !== removed?.id)
+    }
+  })
+  if (!removed) return snapshot
+  notifyRenderer(snapshot)
+  if (
+    snapshot.settings.notion.tokenConfigured &&
+    snapshot.settings.notion.databaseId &&
+    snapshot.notionDeletions.some(
+      (deletion) =>
+        deletion.entryId === removed?.id &&
+        (!deletion.databaseId || deletion.databaseId === snapshot.settings.notion.databaseId)
+    )
+  ) {
+    syncInBackground()
+  }
+  return snapshot
+}
+
+async function saveTodo(input: DailyTodoInput): Promise<AppSnapshot> {
+  const snapshot = await store.update((draft) => {
+    saveTodoMutation(draft, input)
+  })
+  notifyRenderer(snapshot)
+  return snapshot
+}
+
+async function toggleTodo(id: string): Promise<AppSnapshot> {
+  const snapshot = await store.update((draft) => {
+    toggleTodoMutation(draft, id)
+  })
+  notifyRenderer(snapshot)
+  return snapshot
+}
+
+async function deleteTodo(id: string): Promise<AppSnapshot> {
+  const snapshot = await store.update((draft) => {
+    deleteTodoMutation(draft, id)
+  })
+  notifyRenderer(snapshot)
+  return snapshot
+}
+
+async function saveIdea(input: ResearchIdeaInput): Promise<AppSnapshot> {
+  const snapshot = await store.update((draft) => {
+    saveIdeaMutation(draft, input)
+  })
+  notifyRenderer(snapshot)
+  return snapshot
+}
+
+async function deleteIdea(id: string): Promise<AppSnapshot> {
+  const snapshot = await store.update((draft) => {
+    deleteIdeaMutation(draft, id)
   })
   notifyRenderer(snapshot)
   return snapshot
@@ -341,6 +405,11 @@ function registerIpc(): void {
   ipcMain.handle('preset:delete', (_event, id: string) => deletePreset(id))
   ipcMain.handle('entry:create', (_event, input: ManualEntryInput) => createEntry(input))
   ipcMain.handle('entry:delete', (_event, id: string) => deleteEntry(id))
+  ipcMain.handle('todo:save', (_event, input: DailyTodoInput) => saveTodo(input))
+  ipcMain.handle('todo:toggle', (_event, id: string) => toggleTodo(id))
+  ipcMain.handle('todo:delete', (_event, id: string) => deleteTodo(id))
+  ipcMain.handle('idea:save', (_event, input: ResearchIdeaInput) => saveIdea(input))
+  ipcMain.handle('idea:delete', (_event, id: string) => deleteIdea(id))
   ipcMain.handle('notion:update-settings', async (_event, input: NotionSettingsInput) => {
     const snapshot = await notion.saveSettings(input)
     notifyRenderer(snapshot)
@@ -388,8 +457,21 @@ if (!gotLock) {
     setInterval(async () => {
       const snapshot = await store.getSnapshot()
       const notionSettings = snapshot.settings.notion
-      const hasQueuedEntries = snapshot.entries.some((entry) => ['pending', 'error'].includes(entry.syncStatus))
-      if (notionSettings.tokenConfigured && notionSettings.databaseId && hasQueuedEntries) syncInBackground()
+      const hasQueuedEntries = snapshot.entries.some(
+        (entry) =>
+          ['pending', 'error'].includes(entry.syncStatus) &&
+          (!entry.notionDatabaseId || entry.notionDatabaseId === notionSettings.databaseId)
+      )
+      const hasQueuedDeletions = snapshot.notionDeletions.some(
+        (deletion) => !deletion.databaseId || deletion.databaseId === notionSettings.databaseId
+      )
+      if (
+        notionSettings.tokenConfigured &&
+        notionSettings.databaseId &&
+        (hasQueuedEntries || hasQueuedDeletions)
+      ) {
+        syncInBackground()
+      }
     }, 60_000).unref()
 
     app.on('activate', () => {
