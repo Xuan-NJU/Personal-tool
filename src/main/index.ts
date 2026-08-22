@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, Menu, nativeImage, net, Notification, powerMonitor, session, Tray } from 'electron'
+import { app, BrowserWindow, ipcMain, Menu, nativeImage, net, Notification, powerMonitor, session, shell, Tray } from 'electron'
 import { join } from 'node:path'
 import type {
   AppSnapshot,
@@ -8,7 +8,9 @@ import type {
   NotionSettingsInput,
   NotionTestInput,
   PresetInput,
+  ReminderSettingsInput,
   ResearchIdeaInput,
+  TimerCompletion,
   TimerStartInput
 } from '../shared/types'
 import { elapsedMs, isTimerDue } from '../shared/timer'
@@ -23,6 +25,7 @@ import {
 import { shouldRunNotionBackgroundSync } from './notion-background-sync'
 import { NotionService } from './notion'
 import { AppStore } from './store'
+import { completeActiveTimer } from './timer-completion'
 
 let mainWindow: BrowserWindow | null = null
 let tray: Tray | null = null
@@ -30,6 +33,7 @@ let isQuitting = false
 let finishingTimer = false
 let syncPromise: Promise<AppSnapshot> | null = null
 let syncPromiseKey: string | null = null
+const liveNotifications = new Set<Notification>()
 
 const store = new AppStore(process.env.PERSONAL_TOOL_DATA_DIR)
 // Chromium's network stack follows the user's Windows proxy and certificate
@@ -38,12 +42,128 @@ const notion = new NotionService(store, (input, init) => net.fetch(input, init))
 
 function notifyRenderer(snapshot: AppSnapshot): void {
   for (const window of BrowserWindow.getAllWindows()) {
-    if (!window.isDestroyed()) window.webContents.send('snapshot:changed', snapshot)
+    if (!window.isDestroyed()) {
+      try {
+        window.webContents.send('snapshot:changed', snapshot)
+      } catch {
+        // A renderer can disappear between the destroyed check and send.
+      }
+    }
   }
 }
 
 async function broadcastCurrent(): Promise<void> {
   notifyRenderer(await store.getSnapshot())
+}
+
+function stopWindowAttention(): void {
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  try {
+    mainWindow.flashFrame(false)
+  } catch {
+    // Window attention is a best-effort reminder only.
+  }
+}
+
+function showMainWindow(): void {
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  try {
+    if (mainWindow.isMinimized()) mainWindow.restore()
+    mainWindow.show()
+    mainWindow.focus()
+    stopWindowAttention()
+  } catch {
+    // The window may be closing while a notification is clicked.
+  }
+}
+
+function keepNotificationAlive(notification: Notification): void {
+  liveNotifications.add(notification)
+  const release = (): void => {
+    liveNotifications.delete(notification)
+  }
+  notification.once('close', release)
+  notification.once('failed', release)
+  setTimeout(release, 60 * 60_000).unref()
+}
+
+function focusDurationLabel(focusMs: number): string {
+  const totalSeconds = Math.max(1, Math.round(focusMs / 1_000))
+  if (totalSeconds < 60) return `${totalSeconds} 秒`
+  const totalMinutes = Math.round(totalSeconds / 60)
+  const hours = Math.floor(totalMinutes / 60)
+  const minutes = totalMinutes % 60
+  if (hours && minutes) return `${hours} 小时 ${minutes} 分钟`
+  if (hours) return `${hours} 小时`
+  return `${totalMinutes} 分钟`
+}
+
+function presentTimerCompletion(completion: TimerCompletion, snapshot: AppSnapshot): void {
+  const reminders = snapshot.settings.reminders
+  try {
+    if (reminders.showWindow && mainWindow && !mainWindow.isDestroyed()) {
+      if (mainWindow.isMinimized()) mainWindow.restore()
+      if (!mainWindow.isFocused()) {
+        mainWindow.showInactive()
+        mainWindow.moveTop()
+      }
+    }
+  } catch {
+    // The persistent in-app completion remains available on the next render.
+  }
+
+  if (reminders.flashTaskbar) {
+    try {
+      if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.isFocused()) {
+        mainWindow.flashFrame(true)
+      }
+    } catch {
+      // Some Windows configurations do not expose a flashable taskbar button.
+    }
+  }
+
+  if (reminders.playSound) {
+    try {
+      shell.beep()
+    } catch {
+      // Sound must never affect saving the completed session.
+    }
+  }
+
+  if (reminders.systemNotification) {
+    try {
+      if (!Notification.isSupported()) return
+      const notification = new Notification({
+        title: '番茄钟完成 · 该休息一下了',
+        body: `${completion.title} · 已专注 ${focusDurationLabel(completion.focusMs)}`,
+        silent: true,
+        timeoutType: 'never',
+        urgency: 'critical'
+      })
+      notification.on('click', showMainWindow)
+      keepNotificationAlive(notification)
+      notification.show()
+    } catch {
+      // The application modal, sound and taskbar attention remain as fallbacks.
+    }
+  }
+}
+
+function presentManualCompletion(title: string, snapshot: AppSnapshot): void {
+  if (!snapshot.settings.reminders.systemNotification) return
+  try {
+    if (!Notification.isSupported()) return
+    const notification = new Notification({
+      title: '已记录本次专注',
+      body: title,
+      silent: true
+    })
+    notification.on('click', showMainWindow)
+    keepNotificationAlive(notification)
+    notification.show()
+  } catch {
+    // Renderer feedback already confirms manual completion.
+  }
 }
 
 function createMainWindow(): BrowserWindow {
@@ -64,6 +184,7 @@ function createMainWindow(): BrowserWindow {
   })
 
   window.once('ready-to-show', () => window.show())
+  window.on('focus', stopWindowAttention)
   window.on('close', (event) => {
     if (!isQuitting) {
       event.preventDefault()
@@ -93,10 +214,7 @@ function createTray(): void {
     Menu.buildFromTemplate([
       {
         label: '显示 Personal Tool',
-        click: () => {
-          mainWindow?.show()
-          mainWindow?.focus()
-        }
+        click: showMainWindow
       },
       { type: 'separator' },
       {
@@ -109,7 +227,7 @@ function createTray(): void {
       },
       {
         label: '完成当前计时',
-        click: () => void finishTimer(false)
+        click: () => void finishTimer(false).catch(() => undefined)
       },
       { type: 'separator' },
       {
@@ -122,8 +240,7 @@ function createTray(): void {
     ])
   )
   tray.on('double-click', () => {
-    mainWindow?.show()
-    mainWindow?.focus()
+    showMainWindow()
   })
 }
 
@@ -154,14 +271,26 @@ async function startTimer(input: TimerStartInput): Promise<AppSnapshot> {
 }
 
 async function pauseTimer(): Promise<AppSnapshot> {
+  const completionBox: { value: ReturnType<typeof completeActiveTimer> } = { value: null }
   const snapshot = await store.update((draft) => {
     const timer = draft.activeTimer
     if (!timer || timer.status === 'paused') return
-    timer.accumulatedMs = elapsedMs(timer)
+    const nowMs = Date.now()
+    if (isTimerDue(timer, nowMs)) {
+      completionBox.value = completeActiveTimer(draft, {
+        automatic: true,
+        nowMs,
+        expectedTimerId: timer.id
+      })
+      return
+    }
+    timer.accumulatedMs = elapsedMs(timer, nowMs)
     timer.runningSince = null
     timer.status = 'paused'
   })
   notifyRenderer(snapshot)
+  const completionResult = completionBox.value
+  if (completionResult) presentCompletedTimer(snapshot, completionResult, true)
   return snapshot
 }
 
@@ -180,59 +309,50 @@ async function finishTimer(automatic: boolean): Promise<AppSnapshot> {
   if (finishingTimer) return store.getSnapshot()
   finishingTimer = true
   try {
-    let finishedTitle: string | undefined
-    let shouldSync = false
+    const completionBox: { value: ReturnType<typeof completeActiveTimer> } = { value: null }
     const snapshot = await store.update((draft) => {
-      const timer = draft.activeTimer
-      if (!timer) return
-      const nowMs = Date.now()
-      const measuredMs = elapsedMs(timer, nowMs)
-      const reachedCountdownEnd =
-        timer.mode === 'countdown' &&
-        timer.plannedDurationMs !== null &&
-        measuredMs >= timer.plannedDurationMs
-      const focusMs = reachedCountdownEnd ? (timer.plannedDurationMs as number) : measuredMs
-      const finishMs =
-        automatic && reachedCountdownEnd ? nowMs - Math.max(0, measuredMs - focusMs) : nowMs
-      const notionSettings = draft.settings.notion
-      shouldSync =
-        timer.autoSync &&
-        notionSettings.autoSyncPomodoros &&
-        notionSettings.tokenConfigured &&
-        Boolean(notionSettings.databaseId)
-      const now = new Date().toISOString()
-      const entry: CalendarEntry = {
-        id: crypto.randomUUID(),
-        kind: 'pomodoro',
-        source: 'local',
-        title: timer.title,
-        notes: '',
-        startAt: timer.startedAt,
-        endAt: new Date(Math.max(new Date(timer.startedAt).getTime() + 1000, finishMs)).toISOString(),
-        focusMs,
-        plannedDurationMs: timer.plannedDurationMs ?? undefined,
-        timerMode: timer.mode,
-        syncStatus: shouldSync ? 'pending' : 'local',
-        ...(shouldSync ? { notionDatabaseId: notionSettings.databaseId } : {}),
-        createdAt: now,
-        updatedAt: now
-      }
-      draft.entries.push(entry)
-      draft.activeTimer = null
-      finishedTitle = entry.title
+      completionBox.value = completeActiveTimer(draft, { automatic })
     })
+    const completionResult = completionBox.value
+    if (!completionResult) return snapshot
     notifyRenderer(snapshot)
-    if (finishedTitle && Notification.isSupported()) {
-      new Notification({
-        title: automatic ? '番茄钟完成' : '已记录本次专注',
-        body: finishedTitle
-      }).show()
-    }
-    if (shouldSync) syncInBackground()
+    presentCompletedTimer(snapshot, completionResult, automatic)
     return snapshot
   } finally {
     finishingTimer = false
   }
+}
+
+function presentCompletedTimer(
+  snapshot: AppSnapshot,
+  completionResult: NonNullable<ReturnType<typeof completeActiveTimer>>,
+  automatic: boolean
+): void {
+  if (completionResult.shouldSync) syncInBackground()
+  if (automatic && snapshot.pendingTimerCompletion) {
+    presentTimerCompletion(snapshot.pendingTimerCompletion, snapshot)
+  } else {
+    presentManualCompletion(completionResult.entry.title, snapshot)
+  }
+}
+
+async function acknowledgeTimerCompletion(id: string): Promise<AppSnapshot> {
+  const snapshot = await store.update((draft) => {
+    if (draft.pendingTimerCompletion?.id === id) draft.pendingTimerCompletion = null
+  })
+  stopWindowAttention()
+  notifyRenderer(snapshot)
+  return snapshot
+}
+
+async function updateReminderSettings(input: ReminderSettingsInput): Promise<AppSnapshot> {
+  const values = [input.systemNotification, input.playSound, input.showWindow, input.flashTaskbar]
+  if (values.some((value) => typeof value !== 'boolean')) throw new Error('提醒设置格式不正确。')
+  const snapshot = await store.update((draft) => {
+    draft.settings.reminders = { ...input }
+  })
+  notifyRenderer(snapshot)
+  return snapshot
 }
 
 async function resetTimer(): Promise<AppSnapshot> {
@@ -425,6 +545,7 @@ function registerIpc(): void {
   ipcMain.handle('timer:resume', () => resumeTimer())
   ipcMain.handle('timer:finish', () => finishTimer(false))
   ipcMain.handle('timer:reset', () => resetTimer())
+  ipcMain.handle('timer:acknowledge-completion', (_event, id: string) => acknowledgeTimerCompletion(id))
   ipcMain.handle('preset:save', (_event, input: PresetInput) => savePreset(input))
   ipcMain.handle('preset:delete', (_event, id: string) => deletePreset(id))
   ipcMain.handle('entry:create', (_event, input: ManualEntryInput) => createEntry(input))
@@ -434,6 +555,7 @@ function registerIpc(): void {
   ipcMain.handle('todo:delete', (_event, id: string) => deleteTodo(id))
   ipcMain.handle('idea:save', (_event, input: ResearchIdeaInput) => saveIdea(input))
   ipcMain.handle('idea:delete', (_event, id: string) => deleteIdea(id))
+  ipcMain.handle('reminders:update-settings', (_event, input: ReminderSettingsInput) => updateReminderSettings(input))
   ipcMain.handle('notion:update-settings', async (_event, input: NotionSettingsInput) => {
     const snapshot = await notion.saveSettings(input)
     notifyRenderer(snapshot)
@@ -451,16 +573,14 @@ function registerIpc(): void {
   })
 }
 
+app.setAppUserModelId('com.xuannju.personaltool')
+
 const gotLock = app.requestSingleInstanceLock()
 if (!gotLock) {
   app.quit()
 } else {
   app.on('second-instance', () => {
-    if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore()
-      mainWindow.show()
-      mainWindow.focus()
-    }
+    showMainWindow()
   })
 
   app.whenReady().then(async () => {
@@ -471,11 +591,17 @@ if (!gotLock) {
     createTray()
 
     const initial = await store.getSnapshot()
-    if (initial.activeTimer && isTimerDue(initial.activeTimer)) await finishTimer(true)
+    if (initial.activeTimer && isTimerDue(initial.activeTimer)) {
+      await finishTimer(true)
+    } else if (initial.pendingTimerCompletion) {
+      presentTimerCompletion(initial.pendingTimerCompletion, initial)
+    }
 
-    setInterval(async () => {
-      const snapshot = await store.getSnapshot()
-      if (snapshot.activeTimer && isTimerDue(snapshot.activeTimer)) void finishTimer(true)
+    setInterval(() => {
+      void store.getSnapshot().then((snapshot) => {
+        if (snapshot.activeTimer && isTimerDue(snapshot.activeTimer)) return finishTimer(true)
+        return undefined
+      }).catch(() => undefined)
     }, 1000).unref()
 
     setInterval(async () => {
@@ -487,12 +613,16 @@ if (!gotLock) {
     // heals without asking the user to re-enter credentials.
     setTimeout(() => void syncConfiguredNotionInBackground(), 3_000).unref()
     powerMonitor.on('resume', () => {
+      void store.getSnapshot().then((snapshot) => {
+        if (snapshot.activeTimer && isTimerDue(snapshot.activeTimer)) return finishTimer(true)
+        return undefined
+      }).catch(() => undefined)
       setTimeout(() => void syncConfiguredNotionInBackground(), 3_000).unref()
     })
 
     app.on('activate', () => {
       if (!mainWindow || mainWindow.isDestroyed()) mainWindow = createMainWindow()
-      mainWindow.show()
+      showMainWindow()
     })
   })
 }

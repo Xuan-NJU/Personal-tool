@@ -146,5 +146,7 @@ export function elapsedSeconds(timer: UiTimerSession | null, now: number): numbe
 export function timerDisplaySeconds(timer: UiTimerSession | null, now: number): number {
   if (!timer) return 0;
   const remaining = remainingMs(timer.raw, now);
-  return Math.floor((remaining ?? elapsedMs(timer.raw, now)) / 1_000);
+  return remaining === null
+    ? Math.floor(elapsedMs(timer.raw, now) / 1_000)
+    : Math.ceil(remaining / 1_000);
 }

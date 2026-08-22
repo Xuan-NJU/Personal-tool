@@ -7,6 +7,7 @@ import type {
   NotionTestInput,
   PersonalToolAPI,
   PresetInput,
+  ReminderSettingsInput,
   ResearchIdeaInput,
   TimerStartInput
 } from '../shared/types'
@@ -18,6 +19,7 @@ const api: PersonalToolAPI = {
   timerResume: () => ipcRenderer.invoke('timer:resume'),
   timerFinish: () => ipcRenderer.invoke('timer:finish'),
   timerReset: () => ipcRenderer.invoke('timer:reset'),
+  acknowledgeTimerCompletion: (id: string) => ipcRenderer.invoke('timer:acknowledge-completion', id),
   savePreset: (input: PresetInput) => ipcRenderer.invoke('preset:save', input),
   deletePreset: (id: string) => ipcRenderer.invoke('preset:delete', id),
   createEntry: (input: ManualEntryInput) => ipcRenderer.invoke('entry:create', input),
@@ -27,6 +29,7 @@ const api: PersonalToolAPI = {
   deleteTodo: (id: string) => ipcRenderer.invoke('todo:delete', id),
   saveIdea: (input: ResearchIdeaInput) => ipcRenderer.invoke('idea:save', input),
   deleteIdea: (id: string) => ipcRenderer.invoke('idea:delete', id),
+  updateReminderSettings: (input: ReminderSettingsInput) => ipcRenderer.invoke('reminders:update-settings', input),
   updateNotionSettings: (input: NotionSettingsInput) => ipcRenderer.invoke('notion:update-settings', input),
   testNotion: (input: NotionTestInput) => ipcRenderer.invoke('notion:test', input),
   syncNotion: () => ipcRenderer.invoke('notion:sync'),

@@ -95,14 +95,33 @@ export interface NotionSettings {
   lastError?: string
 }
 
+export interface ReminderSettings {
+  systemNotification: boolean
+  playSound: boolean
+  showWindow: boolean
+  flashTaskbar: boolean
+}
+
+export interface TimerCompletion {
+  id: string
+  entryId: string
+  timerId: string
+  title: string
+  focusMs: number
+  plannedDurationMs?: number
+  completedAt: string
+}
+
 export interface AppSettings {
   notion: NotionSettings
+  reminders: ReminderSettings
 }
 
 export interface AppSnapshot {
   version: number
   presets: Preset[]
   activeTimer: TimerSession | null
+  pendingTimerCompletion: TimerCompletion | null
   entries: CalendarEntry[]
   todos: DailyTodo[]
   ideas: ResearchIdea[]
@@ -168,6 +187,13 @@ export interface NotionTestResult {
   dateProperty?: string
 }
 
+export interface ReminderSettingsInput {
+  systemNotification: boolean
+  playSound: boolean
+  showWindow: boolean
+  flashTaskbar: boolean
+}
+
 export interface PersonalToolAPI {
   getSnapshot(): Promise<AppSnapshot>
   timerStart(input: TimerStartInput): Promise<AppSnapshot>
@@ -175,6 +201,7 @@ export interface PersonalToolAPI {
   timerResume(): Promise<AppSnapshot>
   timerFinish(): Promise<AppSnapshot>
   timerReset(): Promise<AppSnapshot>
+  acknowledgeTimerCompletion(id: string): Promise<AppSnapshot>
   savePreset(input: PresetInput): Promise<AppSnapshot>
   deletePreset(id: string): Promise<AppSnapshot>
   createEntry(input: ManualEntryInput): Promise<AppSnapshot>
@@ -184,6 +211,7 @@ export interface PersonalToolAPI {
   deleteTodo(id: string): Promise<AppSnapshot>
   saveIdea(input: ResearchIdeaInput): Promise<AppSnapshot>
   deleteIdea(id: string): Promise<AppSnapshot>
+  updateReminderSettings(input: ReminderSettingsInput): Promise<AppSnapshot>
   updateNotionSettings(input: NotionSettingsInput): Promise<AppSnapshot>
   testNotion(input: NotionTestInput): Promise<NotionTestResult>
   syncNotion(): Promise<AppSnapshot>

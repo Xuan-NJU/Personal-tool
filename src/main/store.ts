@@ -3,7 +3,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import type { AppSnapshot } from '../shared/types'
 
-const DATA_VERSION = 2
+const DATA_VERSION = 3
 
 export class UnsupportedDataVersionError extends Error {
   constructor(readonly dataVersion: number) {
@@ -47,11 +47,18 @@ function defaultSnapshot(): AppSnapshot {
       }
     ],
     activeTimer: null,
+    pendingTimerCompletion: null,
     entries: [],
     todos: [],
     ideas: [],
     notionDeletions: [],
     settings: {
+      reminders: {
+        systemNotification: true,
+        playSound: true,
+        showWindow: true,
+        flashTaskbar: true
+      },
       notion: {
         databaseId: '',
         connected: false,
@@ -71,16 +78,22 @@ function normalizeSnapshot(value: Partial<AppSnapshot>): AppSnapshot {
   const ideas = Array.isArray(value.ideas) ? value.ideas : []
   const notionDeletions = Array.isArray(value.notionDeletions) ? value.notionDeletions : []
   const notion = value.settings?.notion
+  const reminders = value.settings?.reminders
 
   return {
     version: DATA_VERSION,
     presets,
     activeTimer: value.activeTimer ?? null,
+    pendingTimerCompletion: value.pendingTimerCompletion ?? null,
     entries,
     todos,
     ideas,
     notionDeletions,
     settings: {
+      reminders: {
+        ...defaults.settings.reminders,
+        ...reminders
+      },
       notion: {
         ...defaults.settings.notion,
         ...notion
@@ -115,7 +128,9 @@ export class AppStore {
         parsed.version !== DATA_VERSION ||
         !Array.isArray(parsed.todos) ||
         !Array.isArray(parsed.ideas) ||
-        !Array.isArray(parsed.notionDeletions)
+        !Array.isArray(parsed.notionDeletions) ||
+        !parsed.settings?.reminders ||
+        !('pendingTimerCompletion' in parsed)
     } catch (error) {
       if (error instanceof UnsupportedDataVersionError) throw error
       const code = (error as NodeJS.ErrnoException).code

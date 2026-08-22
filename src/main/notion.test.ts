@@ -8,14 +8,21 @@ const DATABASE_B = 'fedcba98-7654-3210-fedc-ba9876543210'
 
 function createSnapshot(databaseId = 'database-1'): AppSnapshot {
   return {
-    version: 2,
+    version: 3,
     presets: [],
     activeTimer: null,
+    pendingTimerCompletion: null,
     entries: [],
     todos: [],
     ideas: [],
     notionDeletions: [],
     settings: {
+      reminders: {
+        systemNotification: true,
+        playSound: true,
+        showWindow: true,
+        flashTaskbar: true
+      },
       notion: {
         databaseId,
         connected: true,

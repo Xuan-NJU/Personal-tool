@@ -10,14 +10,21 @@ const DATABASE_ID = 'database-current'
 
 function snapshot(overrides: Partial<AppSnapshot['settings']['notion']> = {}): AppSnapshot {
   return {
-    version: 2,
+    version: 3,
     presets: [],
     activeTimer: null,
+    pendingTimerCompletion: null,
     entries: [],
     todos: [],
     ideas: [],
     notionDeletions: [],
     settings: {
+      reminders: {
+        systemNotification: true,
+        playSound: true,
+        showWindow: true,
+        flashTaskbar: true
+      },
       notion: {
         databaseId: DATABASE_ID,
         connected: false,

@@ -24,7 +24,8 @@ export type IconName =
   | 'list-check'
   | 'lightbulb'
   | 'search'
-  | 'info';
+  | 'info'
+  | 'bell';
 
 export function Icon({ name, size = 20 }: { name: IconName; size?: number }) {
   const common = {
@@ -63,6 +64,7 @@ export function Icon({ name, size = 20 }: { name: IconName; size?: number }) {
     lightbulb: <><path d="M9 18h6M10 22h4M8.5 15.5A7 7 0 1 1 15.5 15.5c-.9.7-1.3 1.3-1.5 2.5h-4c-.2-1.2-.6-1.8-1.5-2.5Z" /></>,
     search: <><circle cx="11" cy="11" r="7" /><path d="m20 20-4-4" /></>,
     info: <><circle cx="12" cy="12" r="9" /><path d="M12 11v5M12 8h.01" /></>,
+    bell: <><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9" /><path d="M10 21h4" /></>,
   };
   return <svg {...common}>{paths[name]}</svg>;
 }
@@ -75,6 +77,11 @@ export function Modal({
   children,
   footer,
   width = '560px',
+  role = 'dialog',
+  closeOnBackdrop = true,
+  closeOnEscape = true,
+  className = '',
+  backdropClassName = '',
 }: PropsWithChildren<{
   open: boolean;
   title: string;
@@ -82,6 +89,11 @@ export function Modal({
   onClose: () => void;
   footer?: ReactNode;
   width?: string;
+  role?: 'dialog' | 'alertdialog';
+  closeOnBackdrop?: boolean;
+  closeOnEscape?: boolean;
+  className?: string;
+  backdropClassName?: string;
 }>) {
   const titleId = useId();
   const descriptionId = useId();
@@ -97,6 +109,18 @@ export function Modal({
     const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     const previousOverflow = document.body.style.overflow;
     document.body.style.overflow = 'hidden';
+    const currentBackdrop = dialogRef.current?.closest<HTMLElement>('.modal-backdrop');
+    const obscuredBackdrops = Array.from(document.querySelectorAll<HTMLElement>('.modal-backdrop'))
+      .filter((backdrop) => backdrop !== currentBackdrop && Boolean(backdrop.querySelector('.modal')))
+      .map((backdrop) => ({
+        backdrop,
+        ariaHidden: backdrop.getAttribute('aria-hidden'),
+        inert: backdrop.inert,
+      }));
+    obscuredBackdrops.forEach(({ backdrop }) => {
+      backdrop.setAttribute('aria-hidden', 'true');
+      backdrop.inert = true;
+    });
 
     const focusableSelector = [
       'button:not(:disabled)',
@@ -116,14 +140,15 @@ export function Modal({
     });
 
     const onKeyDown = (event: KeyboardEvent) => {
+      const dialog = dialogRef.current;
+      const openDialogs = Array.from(document.querySelectorAll<HTMLElement>('.modal[role="dialog"], .modal[role="alertdialog"]'));
+      if (!dialog || openDialogs.at(-1) !== dialog) return;
       if (event.key === 'Escape') {
         event.preventDefault();
-        onCloseRef.current();
+        if (closeOnEscape) onCloseRef.current();
         return;
       }
       if (event.key !== 'Tab') return;
-      const dialog = dialogRef.current;
-      if (!dialog) return;
       const focusable = Array.from(dialog.querySelectorAll<HTMLElement>(focusableSelector));
       if (!focusable.length) {
         event.preventDefault();
@@ -144,18 +169,24 @@ export function Modal({
     return () => {
       window.cancelAnimationFrame(animationFrame);
       document.removeEventListener('keydown', onKeyDown);
+      obscuredBackdrops.forEach(({ backdrop, ariaHidden, inert }) => {
+        if (!backdrop.isConnected) return;
+        if (ariaHidden === null) backdrop.removeAttribute('aria-hidden');
+        else backdrop.setAttribute('aria-hidden', ariaHidden);
+        backdrop.inert = inert;
+      });
       document.body.style.overflow = previousOverflow;
       if (previousFocus?.isConnected) previousFocus.focus();
     };
-  }, [open]);
+  }, [closeOnEscape, open]);
 
   if (!open) return null;
   return (
-    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+    <div className={`modal-backdrop ${backdropClassName}`.trim()} role="presentation" onMouseDown={(event) => closeOnBackdrop && event.target === event.currentTarget && onClose()}>
       <section
-        className="modal"
+        className={`modal ${className}`.trim()}
         ref={dialogRef}
-        role="dialog"
+        role={role}
         aria-modal="true"
         aria-labelledby={titleId}
         aria-describedby={description ? descriptionId : undefined}

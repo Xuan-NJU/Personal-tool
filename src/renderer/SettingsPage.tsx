@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import type { NotionTestResult } from '../shared/types';
+import type { NotionTestResult, ReminderSettingsInput } from '../shared/types';
 import { errorMessage, personalToolApi } from './api';
 import { Icon, Spinner, Switch } from './components';
 import { relativeSyncTime } from './format';
@@ -17,7 +17,11 @@ export function SettingsPage({ snapshot, commitSnapshot, notify }: SettingsPageP
   const [token, setToken] = useState('');
   const [autoSyncPomodoros, setAutoSyncPomodoros] = useState(snapshot.notion.autoSyncPomodoros);
   const [autoSyncManual, setAutoSyncManual] = useState(snapshot.notion.autoSyncManual);
-  const [busy, setBusy] = useState<'test' | 'save' | 'sync' | null>(null);
+  const [systemNotification, setSystemNotification] = useState(snapshot.raw.settings.reminders.systemNotification);
+  const [playSound, setPlaySound] = useState(snapshot.raw.settings.reminders.playSound);
+  const [showWindow, setShowWindow] = useState(snapshot.raw.settings.reminders.showWindow);
+  const [flashTaskbar, setFlashTaskbar] = useState(snapshot.raw.settings.reminders.flashTaskbar);
+  const [busy, setBusy] = useState<'test' | 'save' | 'sync' | 'reminder' | null>(null);
   const [testResult, setTestResult] = useState<NotionTestResult | null>(null);
 
   useEffect(() => {
@@ -25,6 +29,18 @@ export function SettingsPage({ snapshot, commitSnapshot, notify }: SettingsPageP
     setAutoSyncPomodoros(snapshot.notion.autoSyncPomodoros);
     setAutoSyncManual(snapshot.notion.autoSyncManual);
   }, [snapshot.notion.autoSyncManual, snapshot.notion.autoSyncPomodoros, snapshot.notion.databaseId]);
+
+  useEffect(() => {
+    setSystemNotification(snapshot.raw.settings.reminders.systemNotification);
+    setPlaySound(snapshot.raw.settings.reminders.playSound);
+    setShowWindow(snapshot.raw.settings.reminders.showWindow);
+    setFlashTaskbar(snapshot.raw.settings.reminders.flashTaskbar);
+  }, [
+    snapshot.raw.settings.reminders.flashTaskbar,
+    snapshot.raw.settings.reminders.playSound,
+    snapshot.raw.settings.reminders.showWindow,
+    snapshot.raw.settings.reminders.systemNotification,
+  ]);
 
   const notionConnected = snapshot.notion.connectionState !== 'disconnected';
   const notionDegraded = snapshot.notion.connectionState === 'degraded';
@@ -103,13 +119,37 @@ export function SettingsPage({ snapshot, commitSnapshot, notify }: SettingsPageP
     }
   };
 
+  const reminderSettings: ReminderSettingsInput = { systemNotification, playSound, showWindow, flashTaskbar };
+
+  const applyReminderState = (next: ReminderSettingsInput) => {
+    setSystemNotification(next.systemNotification);
+    setPlaySound(next.playSound);
+    setShowWindow(next.showWindow);
+    setFlashTaskbar(next.flashTaskbar);
+  };
+
+  const updateReminders = async (next: ReminderSettingsInput) => {
+    applyReminderState(next);
+    setBusy('reminder');
+    try {
+      const updated = await personalToolApi().updateReminderSettings(next);
+      commitSnapshot(updated);
+      notify('结束提醒设置已保存', 'success');
+    } catch (cause) {
+      applyReminderState(snapshot.raw.settings.reminders);
+      notify(errorMessage(cause), 'error');
+    } finally {
+      setBusy(null);
+    }
+  };
+
   return (
     <div className="page settings-page">
       <header className="page-header">
         <div>
           <p className="eyebrow">偏好与连接</p>
           <h1 className="page-title">设置</h1>
-          <p className="page-subtitle">控制记录如何保存，以及何时同步到 Notion。</p>
+          <p className="page-subtitle">控制结束提醒、记录保存，以及何时同步到 Notion。</p>
         </div>
       </header>
 
@@ -172,6 +212,33 @@ export function SettingsPage({ snapshot, commitSnapshot, notify }: SettingsPageP
         </section>
 
         <div className="settings-side">
+          <section className="panel settings-section reminder-settings-section">
+            <div className="settings-section-header">
+              <span className="settings-section-icon reminder"><Icon name="bell" /></span>
+              <div><h2>结束提醒</h2><p>番茄钟完成时，用多种方式确保你不会错过。</p></div>
+            </div>
+            <div className="reminder-guarantee"><Icon name="check" size={17} /><span><strong>应用内醒目弹窗始终保留</strong><small>直到你确认后才会消失</small></span></div>
+            <div className="setting-list">
+              <div className="setting-row">
+                <div><strong>自动显示窗口</strong><small>从托盘唤起提醒，但不抢占键盘焦点</small></div>
+                <Switch checked={showWindow} disabled={busy !== null} onChange={(value) => void updateReminders({ ...reminderSettings, showWindow: value })} label="结束时自动显示窗口" />
+              </div>
+              <div className="setting-row">
+                <div><strong>Windows 系统通知</strong><small>在通知中心保留一条完成提醒</small></div>
+                <Switch checked={systemNotification} disabled={busy !== null} onChange={(value) => void updateReminders({ ...reminderSettings, systemNotification: value })} label="显示系统通知" />
+              </div>
+              <div className="setting-row">
+                <div><strong>提示音</strong><small>结束时播放一次系统提示音</small></div>
+                <Switch checked={playSound} disabled={busy !== null} onChange={(value) => void updateReminders({ ...reminderSettings, playSound: value })} label="播放结束提示音" />
+              </div>
+              <div className="setting-row">
+                <div><strong>任务栏闪烁</strong><small>窗口未聚焦时持续吸引注意</small></div>
+                <Switch checked={flashTaskbar} disabled={busy !== null} onChange={(value) => void updateReminders({ ...reminderSettings, flashTaskbar: value })} label="结束时闪烁任务栏" />
+              </div>
+            </div>
+            {busy === 'reminder' && <span className="reminder-saving"><Spinner />正在保存提醒设置</span>}
+          </section>
+
           <section className="panel settings-section">
             <div className="settings-section-header">
               <span className="settings-section-icon warm"><Icon name="refresh" /></span>

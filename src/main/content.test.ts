@@ -7,14 +7,21 @@ const secondTime = '2026-08-21T02:00:00.000Z'
 
 function createSnapshot(): AppSnapshot {
   return {
-    version: 2,
+    version: 3,
     presets: [],
     activeTimer: null,
+    pendingTimerCompletion: null,
     entries: [],
     todos: [],
     ideas: [],
     notionDeletions: [],
     settings: {
+      reminders: {
+        systemNotification: true,
+        playSound: true,
+        showWindow: true,
+        flashTaskbar: true
+      },
       notion: {
         databaseId: '',
         connected: false,

@@ -1,9 +1,9 @@
 import { useEffect, useState } from 'react';
 import { errorMessage, personalToolApi } from './api';
 import { CalendarPage } from './CalendarPage';
-import { EmptyState, Icon, Spinner, type IconName } from './components';
+import { EmptyState, Icon, Modal, Spinner, type IconName } from './components';
 import { FocusPage } from './FocusPage';
-import { formatTimer, relativeSyncTime } from './format';
+import { formatDuration, formatTimer, relativeSyncTime } from './format';
 import { IdeasPage } from './IdeasPage';
 import { PlannerPage } from './PlannerPage';
 import { SettingsPage } from './SettingsPage';
@@ -26,6 +26,8 @@ export function App() {
   const [page, setPage] = useState<PageName>('focus');
   const [notice, setNotice] = useState<{ id: number; message: string; kind: NoticeKind } | null>(null);
   const [miniBusy, setMiniBusy] = useState(false);
+  const [completionBusy, setCompletionBusy] = useState(false);
+  const [completionError, setCompletionError] = useState<string | null>(null);
   const [now, setNow] = useState(Date.now());
 
   useEffect(() => {
@@ -40,6 +42,10 @@ export function App() {
     return () => window.clearInterval(interval);
   }, [snapshot?.activeTimer]);
 
+  useEffect(() => {
+    setCompletionError(null);
+  }, [snapshot?.raw.pendingTimerCompletion?.id]);
+
   const notify = (message: string, kind: NoticeKind = 'info') => setNotice({ id: Date.now(), message, kind });
 
   const miniToggle = async () => {
@@ -52,6 +58,24 @@ export function App() {
       notify(errorMessage(cause), 'error');
     } finally {
       setMiniBusy(false);
+    }
+  };
+
+  const acknowledgeCompletion = async (destination?: PageName) => {
+    const completion = snapshot?.raw.pendingTimerCompletion;
+    if (!completion || completionBusy) return;
+    setCompletionBusy(true);
+    setCompletionError(null);
+    try {
+      const next = await personalToolApi().acknowledgeTimerCompletion(completion.id);
+      commitSnapshot(next);
+      if (destination) setPage(destination);
+    } catch (cause) {
+      const message = errorMessage(cause);
+      setCompletionError(message);
+      notify(message, 'error');
+    } finally {
+      setCompletionBusy(false);
     }
   };
 
@@ -89,6 +113,7 @@ export function App() {
   const miniSeconds = timerDisplaySeconds(snapshot.activeTimer, now);
   const localDataPage = page === 'planner' || page === 'ideas';
   const showMiniTimer = Boolean(snapshot.activeTimer && page !== 'focus');
+  const completion = snapshot.raw.pendingTimerCompletion;
 
   return (
     <div className={`app-shell ${showMiniTimer ? 'has-mini-timer' : ''}`}>
@@ -173,6 +198,43 @@ export function App() {
           )}
         </div>
       )}
+
+      <Modal
+        open={Boolean(completion)}
+        title="本轮专注完成"
+        description="计时已经结束，记录也已安全保存。"
+        onClose={() => void acknowledgeCompletion()}
+        footer={
+          <>
+            <button className="button button-secondary" type="button" disabled={completionBusy} onClick={() => void acknowledgeCompletion('calendar')}>
+              <Icon name="calendar" />查看日历记录
+            </button>
+            <button className="button button-primary completion-primary" type="button" disabled={completionBusy} data-autofocus onClick={() => void acknowledgeCompletion()}>
+              {completionBusy ? <Spinner /> : <Icon name="check" />}知道了，去休息
+            </button>
+          </>
+        }
+        width="500px"
+        role="alertdialog"
+        closeOnBackdrop={false}
+        className="completion-dialog"
+        backdropClassName="completion-backdrop"
+      >
+        {completion && (
+          <div className="completion-content">
+            <div className="completion-mark" aria-hidden="true">
+              <span className="completion-leaf">◆</span>
+              <span><Icon name="check" size={34} /></span>
+              <i className="completion-ray ray-one" /><i className="completion-ray ray-two" /><i className="completion-ray ray-three" />
+            </div>
+            <p className="completion-kicker">番茄钟响了</p>
+            <strong className="completion-duration">已专注 {formatDuration(Math.max(1, Math.round(completion.focusMs / 1_000)))}</strong>
+            <h3>{completion.title}</h3>
+            <p className="completion-note"><Icon name="device" size={17} />本次记录已保存到本机{snapshot.notion.connectionState === 'degraded' ? '，Notion 将在连接恢复后重试' : ''}</p>
+            {completionError && <p className="completion-error" role="alert"><Icon name="info" size={17} />{completionError}</p>}
+          </div>
+        )}
+      </Modal>
     </div>
   );
 }
